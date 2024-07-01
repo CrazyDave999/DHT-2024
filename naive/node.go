@@ -9,13 +9,12 @@
 package naive
 
 import (
+	"github.com/sirupsen/logrus"
 	"net"
 	"net/rpc"
 	"os"
 	"sync"
 	"time"
-
-	"github.com/sirupsen/logrus"
 )
 
 // Note: The init() function will be executed when this package is imported.
@@ -203,11 +202,11 @@ func (node *Node) broadcastCall(method string, args interface{}, reply interface
 
 func (node *Node) Join(addr string) bool {
 	logrus.Infof("Join %s", addr)
-	// Copy data from the node at addr.
+	// Set data from the node at addr.
 	node.dataLock.Lock()
 	node.RemoteCall(addr, "Node.GetData", "", &node.data)
 	node.dataLock.Unlock()
-	// Copy the peer list from the node at addr.
+	// Set the peer list from the node at addr.
 	node.peersLock.Lock()
 	node.RemoteCall(addr, "Node.GetPeers", "", &node.peers)
 	node.peers[addr] = struct{}{}
