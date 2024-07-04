@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"github.com/sirupsen/logrus"
 	"math/big"
-	"math/rand"
 	"net"
 	"net/rpc"
 	"os"
@@ -24,7 +23,7 @@ const (
 	M             int = 160
 	R             int = 10 // length of successorList
 	PingTime          = 100 * time.Millisecond
-	StabilizeTime     = 100 * time.Millisecond
+	StabilizeTime     = 50 * time.Millisecond
 )
 
 var LENGTH = new(big.Int).Exp(big.NewInt(2), big.NewInt(int64(M)), nil) // length of the Chord ring
@@ -65,7 +64,10 @@ type Node struct {
 	predecessorLock   sync.RWMutex
 	fingerTable       [M]*Meta
 	fingerTableLock   sync.RWMutex
-	quit              chan bool
+	//quit              chan bool
+	fixIndex    int64
+	fingerStart [M]*IDType
+	block       sync.Mutex
 }
 type Pair struct {
 	Key   string
@@ -74,6 +76,9 @@ type Pair struct {
 
 // inRangeOO checks Id x is in (a, b)
 func inRangeOO(x *IDType, a *IDType, b *IDType) bool {
+	if a.Cmp(b) == 0 {
+		return false
+	}
 	if a.Cmp(b) < 0 {
 		return a.Cmp(x) < 0 && x.Cmp(b) < 0
 	}
@@ -91,7 +96,7 @@ func inRangeCC(x *IDType, a *IDType, b *IDType) bool {
 // inRangeOC checks if x is in (a, b]
 func inRangeOC(x *IDType, a *IDType, b *IDType) bool {
 	if a.Cmp(b) == 0 {
-		return true
+		return false
 	}
 	if a.Cmp(b) < 0 {
 		return a.Cmp(x) < 0 && x.Cmp(b) <= 0
@@ -102,7 +107,7 @@ func inRangeOC(x *IDType, a *IDType, b *IDType) bool {
 // inRangeCO checks if x is in [a, b)
 func inRangeCO(x *IDType, a *IDType, b *IDType) bool {
 	if a.Cmp(b) == 0 {
-		return true
+		return false
 	}
 	if a.Cmp(b) < 0 {
 		return a.Cmp(x) <= 0 && x.Cmp(b) < 0
@@ -130,22 +135,22 @@ func (node *Node) Init(addr string) {
 	}
 
 	for i := 0; i < M; i++ {
-		node.fingerTable[i] = &Meta{
-			Id:   new(IDType),
-			Addr: "",
-		}
+		node.fingerTable[i] = new(Meta).Set(node.meta)
+		node.fingerStart[i] = new(IDType).Add(node.meta.Id, new(IDType).Exp(big.NewInt(2), big.NewInt(int64(i)), nil))
 	}
+	//node.quit = make(chan bool, 1)
+	node.fixIndex = 0
 }
 
 // RemoteCall calls the RPC method at Addr
 func (node *Node) RemoteCall(addr string, method string, args interface{}, reply interface{}) error {
-	if method != "Node.Ping" {
-		logrus.Infof("[%s] RemoteCall %s %s %v", node.meta.Addr, addr, method, args)
-	}
+	//if method != "Node.Ping" {
+	//	logrus.Infof("[%s] RemoteCall %s %s %v", node.meta.Addr, addr, method, args)
+	//}
 	// Note: Here we use DialTimeout to set a timeout of 10 seconds.
 	conn, err := net.DialTimeout("tcp", addr, PingTime)
 	if err != nil {
-		logrus.Error("dialing: ", err)
+		logrus.Errorf("[%s] dialing: %s, %s", node.meta.Addr, addr, err)
 		return err
 	}
 	client := rpc.NewClient(conn)
@@ -179,13 +184,24 @@ func (node *Node) RPCGetValue(key string, reply *string) error {
 		return nil
 	}
 	*reply = ""
-	return fmt.Errorf("failed getting key: %v from node: %v. No such data exists", key, node.meta.Addr)
+	return fmt.Errorf("[%s] RPCGetValue. Failed getting key: %v. No such data exists", node.meta.Addr, key)
+}
+
+func (node *Node) RPCGetData(_ struct{}, reply *map[string]string) error {
+	node.dataLock.RLock()
+	defer node.dataLock.RUnlock()
+	for k, v := range node.data {
+		(*reply)[k] = v
+	}
+	return nil
 }
 
 func (node *Node) RPCGetBackup(_ struct{}, reply *map[string]string) error {
 	node.backupLock.RLock()
 	defer node.backupLock.RUnlock()
-	reply = &node.backup
+	for k, v := range node.backup {
+		(*reply)[k] = v
+	}
 	return nil
 }
 
@@ -211,102 +227,92 @@ func (node *Node) RPCGetSucList(_ struct{}, reply *[R]*Meta) error {
 }
 
 func (node *Node) RPCGetPredecessor(_ struct{}, reply *Meta) error {
-	node.predecessorLock.Lock()
+	node.predecessorLock.RLock()
 	if node.predecessor.Addr != "" && !node.TryPing(node.predecessor.Addr) {
-		// predecessor failed. set predecessor = nil to let the stabilization correct it.
-		// contents previously in node.backup now is in node's response. so they should be added to node's data.
-		// since node's data changed, these contents should also be added to node.successor.backup.
+		node.predecessorLock.RUnlock()
+		node.predecessorLock.Lock()
 		node.predecessor.Addr = ""
 		node.predecessorLock.Unlock()
 		reply.Set(&Meta{
 			Id:   new(IDType),
 			Addr: "",
 		})
-		node.backupLock.Lock()
-		defer node.backupLock.Unlock()
-		node.dataLock.Lock()
-		for k, v := range node.backup {
-			node.data[k] = v
-		}
-		node.dataLock.Unlock()
-		suc := &Meta{}
-		err := node.RPCGetSuccessor(struct{}{}, suc)
-		if err != nil {
-			return err
-		}
-		node.backupLock.RLock()
-		err = node.RemoteCall(suc.Addr, "Node.RPCCopyToBackUp", node.backup, nil)
-		node.backupLock.RUnlock()
-		if err != nil {
-			return err
-		}
-		node.backupLock.Lock()
-		node.backup = make(map[string]string)
-		node.backupLock.Unlock()
 		return nil
 	}
 	reply.Set(node.predecessor)
-	node.predecessorLock.Unlock()
+	node.predecessorLock.RUnlock()
 	return nil
 }
 
 func (node *Node) RPCFindSuccessor(meta *Meta, reply *Meta) error {
+	if node.meta.Id.Cmp(meta.Id) == 0 {
+		reply.Set(node.meta)
+		return nil
+	}
 	suc := &Meta{}
+	//logrus.Infof("[%s] RPCFindSuccessor. RPCGetSuccessor begins.", node.meta.Addr)
 	err := node.RPCGetSuccessor(struct{}{}, suc)
 	if err != nil {
-		logrus.Errorf("RPCFindSuccessor failed when trying to node.RPCGetSuccessor(struct{}{}, suc) with node.meta: %v", *node.meta)
+		logrus.Errorf("RPCFindSuccessor failed when trying to RPCGetSuccessor")
 		return err
 	}
-	if inRangeOC(meta.Id, node.meta.Id, suc.Id) {
+	//logrus.Infof("[%s] RPCFindSuccessor. RPCGetSuccessor ends.", node.meta.Addr)
+	if node.meta.Addr == suc.Addr || inRangeOC(meta.Id, node.meta.Id, suc.Id) {
 		reply.Set(suc)
 		return nil
 	}
 	pred := &Meta{}
+	logrus.Infof("[%s] RPCFindSuccessor. RPCFindPredecessor begins.", node.meta.Addr)
 	err = node.RPCFindPredecessor(meta, pred)
 	if err != nil {
-		logrus.Errorf("RPCFindSuccessor failed when trying to node.RPCFindPredecessor(meta, meta1) with node.meta: %v, meta: %v", *node.meta, *meta)
+		logrus.Errorf("RPCFindSuccessor failed when trying to RPCFindPredecessor")
 		return err
 	}
-	return node.RemoteCall(pred.Addr, "Node.RPCGetSuccessor", struct{}{}, reply)
+	logrus.Infof("[%s] RPCFindSuccessor. RPCFindPredecessor ends.", node.meta.Addr)
+	//logrus.Infof("[%s] RPCFindSuccessor. RPCGetSuccessor begins.", node.meta.Addr)
+	err = node.RemoteCall(pred.Addr, "Node.RPCGetSuccessor", struct{}{}, reply)
+	//logrus.Infof("[%s] RPCFindSuccessor. RPCGetSuccessor ends.", node.meta.Addr)
+	return err
 }
 func (node *Node) RPCFindPredecessor(meta *Meta, reply *Meta) error {
+	logrus.Infof("[%s] RPCFindPredecessor. meta: %s", node.meta.Addr, meta.Addr)
 	pred := (&Meta{}).Set(node.meta)
 	suc := &Meta{}
 	err := node.RPCGetSuccessor(struct{}{}, suc)
 	if err != nil {
 		return err
 	}
-	//logrus.Info("Now start to find predecessor.")
-	//logrus.Infof("meta: %v, pred: %v, suc: %v", meta.Addr, pred.Addr, suc.Addr)
-	if inRangeOC(meta.Id, node.meta.Id, suc.Id) {
+	if meta.Id.Cmp(node.meta.Id) == 0 || inRangeOC(meta.Id, node.meta.Id, suc.Id) {
 		reply.Set(node.meta)
 		return nil
-	}
+	} else {
+		logrus.Infof("[%s] RPCFindPredecessor. RPCClosestPrecedingFinger begins. meta: %s", node.meta.Addr, meta.Addr)
+		err = node.RPCClosestPrecedingFinger(meta, pred)
+		logrus.Infof("[%s] RPCFindPredecessor. RPCClosestPrecedingFinger ends. meta: %s, pred: %s", node.meta.Addr, meta.Addr, pred.Addr)
+		if err != nil {
+			logrus.Errorf("[%s] RPCFindPredecessor. RPCClosestPrecedingFinger failed. meta: %s", node.meta.Addr, meta.Addr)
+			return err
+		}
 
-	for !inRangeOC(meta.Id, pred.Id, suc.Id) {
-		err = node.RemoteCall(pred.Addr, "Node.RPCClosestPrecedingFinger", meta, pred)
-		if err != nil {
-			return err
-		}
-		//logrus.Info("Node.RPCClosestPrecedingFinger finished")
-		err = node.RemoteCall(pred.Addr, "Node.RPCGetSuccessor", struct{}{}, suc)
-		if err != nil {
-			return err
-		}
-		//logrus.Infof("meta: %v, pred: %v, suc: %v", meta.Addr, pred.Addr, suc.Addr)
+		////logrus.Infof("[%s] RPCFindPredecessor. RPCGetSuccessor begins", node.meta.Addr)
+		//err = node.RemoteCall(pred.Addr, "Node.RPCGetSuccessor", struct{}{}, suc)
+		////logrus.Infof("[%s] RPCFindPredecessor. RPCGetSuccessor ends", node.meta.Addr)
+		//if err != nil {
+		//	return err
+		//}
+		return node.RemoteCall(pred.Addr, "Node.RPCFindPredecessor", meta, reply)
 	}
-	//logrus.Info("find predecessor successfully")
-	//logrus.Infof("meta: %v, pred: %v, suc: %v", meta.Addr, pred.Addr, suc.Addr)
-	reply.Set(pred)
-	return nil
 }
 func (node *Node) RPCClosestPrecedingFinger(meta *Meta, reply *Meta) error {
-	node.fingerTableLock.RLock()
-	defer node.fingerTableLock.RUnlock()
 	for i := M - 1; i >= 0; i-- {
-		if node.fingerTable[i].Addr != "" && inRangeOO(node.fingerTable[i].Id, node.meta.Id, meta.Id) && node.TryPing(node.fingerTable[i].Addr) {
-			reply.Set(node.fingerTable[i])
-			return nil
+		node.fingerTableLock.RLock()
+		finger := node.fingerTable[i]
+		node.fingerTableLock.RUnlock()
+		if finger.Addr != "" && inRangeOO(finger.Id, node.meta.Id, meta.Id) {
+			if node.TryPing(finger.Addr) {
+				reply.Set(finger)
+				return nil
+			}
 		}
 	}
 	reply.Set(node.meta)
@@ -314,65 +320,223 @@ func (node *Node) RPCClosestPrecedingFinger(meta *Meta, reply *Meta) error {
 }
 
 func (node *Node) Stabilize() error {
+	//logrus.Infof("[%s] Stabilize begins", node.meta.Addr)
 	suc := &Meta{}
+	//logrus.Infof("[%s] Stabilize. RPCGetSuccessor begins", node.meta.Addr)
 	err := node.RPCGetSuccessor(struct{}{}, suc)
 	if err != nil {
 		logrus.Errorf("Stabilization failed when trying to node.RPCGetSuccessor")
 		return err
 	}
+	//logrus.Infof("[%s] Stabilize. RPCGetSuccessor ends. suc: %s", node.meta.Addr, suc.Addr)
 	pred := &Meta{}
+	//logrus.Infof("[%s] Stabilize RPCGetPredecessor begins", node.meta.Addr)
 	err = node.RemoteCall(suc.Addr, "Node.RPCGetPredecessor", struct{}{}, pred)
 	if err != nil {
-		logrus.Errorf("Stabilization failed when trying to node.RemoteCall(suc.Addr, \"Node.RPCGetPredecessor\", struct{}{}, pred)")
+		logrus.Errorf("Stabilization failed when trying to RPCGetPredecessor")
 		return err
 	}
-	node.successorListLock.Lock()
-	if inRangeOO(pred.Id, node.meta.Id, suc.Id) {
-		suc = node.successorList[0].Set(pred)
-	}
-	node.successorListLock.Unlock()
-	list := &[R]*Meta{}
-	err = node.RemoteCall(suc.Addr, "Node.RPCGetSucList", struct{}{}, list)
-	if err != nil {
-		logrus.Errorf("Stabilization failed when trying to get suc's successorList")
-		return err
-	}
+	//logrus.Infof("[%s] Stabilize RPCGetPredecessor ends. pred: %s", node.meta.Addr, pred.Addr)
 
-	node.successorListLock.Lock()
-	for i := 1; i < R; i++ {
-		node.successorList[i].Set(list[i-1])
+	if pred.Addr != "" && (suc.Addr == node.meta.Addr || inRangeOO(pred.Id, node.meta.Id, suc.Id)) {
+		//logrus.Infof("[%s] RPCTransferData begins", node.meta.Addr)
+
+		err = node.RemoteCall(suc.Addr, "Node.RPCTransferForNewSuccessor", pred, nil)
+		//logrus.Infof("[%s] RPCTransferData ends", node.meta.Addr)
+		node.successorListLock.Lock()
+		for i := R - 1; i >= 1; i-- {
+			node.successorList[i].Set(node.successorList[i-1])
+		}
+		suc = node.successorList[0].Set(pred)
+		node.successorListLock.Unlock()
+	} else {
+		node.successorListLock.Lock()
+		if suc.Addr != node.successorList[0].Addr {
+			node.successorList[0].Set(suc)
+			node.successorListLock.Unlock()
+			node.backupLock.RLock()
+			err = node.RemoteCall(suc.Addr, "Node.RPCTransferForSuccessorFail", node.backup, nil)
+			node.backupLock.RUnlock()
+		} else {
+			node.successorListLock.Unlock()
+		}
+
+		list := &[R]*Meta{}
+
+		//logrus.Infof("[%s] RPCGetSucList begins", node.meta.Addr)
+		err = node.RemoteCall(suc.Addr, "Node.RPCGetSucList", struct{}{}, list)
+		if err != nil {
+			logrus.Errorf("Stabilization failed when trying to get suc's successorList")
+			return err
+		}
+		//logrus.Infof("[%s] RPCGetSucList ends", node.meta.Addr)
+		node.successorListLock.Lock()
+		for i := 1; i < R; i++ {
+			node.successorList[i].Set(list[i-1])
+		}
+		node.successorListLock.Unlock()
 	}
-	node.successorListLock.Unlock()
 
 	err = node.RemoteCall(suc.Addr, "Node.RPCNotify", node.meta, nil)
+
 	if err != nil {
-		logrus.Errorf("Stabilization failed when trying to node.RemoteCall(suc.Addr, \"Node.RPCNotify\", node.meta, struct{}{})")
+		logrus.Errorf("Stabilization failed when trying to Node.RPCNotify")
 		return err
 	}
-	logrus.Info("Heartbeat of node: ", node.meta.Addr)
+
+	node.successorListLock.RLock()
+	sucList := [R]string{}
+	for i := 0; i < R; i++ {
+		l := len(node.successorList[i].Addr)
+		if l < 2 {
+			continue
+		}
+		sucList[i] = node.successorList[i].Addr[l-2:]
+	}
+	node.successorListLock.RUnlock()
+	logrus.Infof("[%s] sucList: %s", node.meta.Addr, sucList)
+
 	return nil
 }
+
+func (node *Node) RPCTransferForQuit(backup map[string]string, _ *struct{}) error {
+	// step 1
+	node.backupLock.RLock()
+	data := make(map[string]string)
+	for k, v := range node.backup {
+		data[k] = v
+	}
+	node.backupLock.RUnlock()
+	node.dataLock.Lock()
+	for k, v := range data {
+		node.data[k] = v
+	}
+	node.dataLock.Unlock()
+
+	// step 2
+	n3 := &Meta{}
+	err := node.RPCGetSuccessor(struct{}{}, n3)
+	if err != nil {
+		return err
+	}
+	err = node.RemoteCall(n3.Addr, "Node.RPCCopyToBackup", data, nil)
+	if err != nil {
+		return err
+	}
+
+	// step 3
+	node.backupLock.Lock()
+	node.backup = make(map[string]string)
+	for k, v := range backup {
+		node.backup[k] = v
+	}
+	node.backupLock.Unlock()
+	return nil
+}
+
+func (node *Node) RPCTransferForNewSuccessor(n1 *Meta, _ *struct{}) error {
+	n2 := node.meta
+	// step 1
+	node.backupLock.RLock()
+	data := make(map[string]string)
+	for k, v := range node.backup {
+		data[k] = v
+	}
+	node.backupLock.RUnlock()
+	err := node.RemoteCall(n1.Addr, "Node.RPCSetBackup", data, nil)
+	if err != nil {
+		return err
+	}
+
+	// step 2
+	node.dataLock.Lock()
+	data = make(map[string]string)
+	for k, v := range node.data {
+		if !inRangeOC(hashString(k), n1.Id, n2.Id) {
+			data[k] = v
+		}
+	}
+	for k := range data {
+		delete(node.data, k)
+	}
+	node.dataLock.Unlock()
+
+	err = node.RemoteCall(n1.Addr, "Node.RPCCopyToData", data, nil)
+	if err != nil {
+		return err
+	}
+
+	// step 3
+	node.backupLock.Lock()
+	node.backup = make(map[string]string)
+	for k, v := range data {
+		node.backup[k] = v
+	}
+	node.backupLock.Unlock()
+
+	// step 4
+	n3 := &Meta{}
+	err = node.RPCGetSuccessor(struct{}{}, n3)
+	if err != nil {
+		return err
+	}
+	err = node.RemoteCall(n3.Addr, "Node.RPCRemoveFromBackup", data, nil)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (node *Node) RPCTransferForSuccessorFail(data map[string]string, _ *struct{}) error {
+	// step 1
+	node.backupLock.RLock()
+	backup := make(map[string]string)
+	for k, v := range node.backup {
+		backup[k] = v
+	}
+	node.backupLock.RUnlock()
+	node.dataLock.Lock()
+	for k, v := range backup {
+		node.data[k] = v
+	}
+	node.dataLock.Unlock()
+
+	// step 2
+	n3 := &Meta{}
+	err := node.RPCGetSuccessor(struct{}{}, n3)
+	if err != nil {
+		return err
+	}
+	err = node.RemoteCall(n3.Addr, "Node.RPCCopyToBackup", backup, nil)
+	if err != nil {
+		return err
+	}
+
+	// step 3
+	node.backupLock.Lock()
+	node.backup = make(map[string]string)
+	for k, v := range data {
+		node.backup[k] = v
+	}
+	node.backupLock.Unlock()
+	return nil
+}
+
 func (node *Node) RPCNotify(meta *Meta, _ *struct{}) error {
 	node.predecessorLock.Lock()
 	defer node.predecessorLock.Unlock()
-	if node.predecessor.Addr == "" || inRangeOO(meta.Id, node.predecessor.Id, node.meta.Id) {
+	if node.predecessor.Addr == "" || node.predecessor.Addr == node.meta.Addr || inRangeOO(meta.Id, node.predecessor.Id, node.meta.Id) {
 		node.predecessor.Set(meta)
 	}
 	return nil
 }
-func pow(i int64) *IDType {
-	return new(IDType).Exp(big.NewInt(2), big.NewInt(i), nil)
-}
-func (node *Node) fingerStart(i int64) *IDType {
-	return new(IDType).Mod(new(IDType).Add(node.meta.Id, pow(i)), LENGTH)
-}
+
 func (node *Node) FixFingers() error {
-	rand.Seed(time.Now().UnixNano())
-	rndIndex := int64(rand.Intn(M-1) + 1)
 
 	sucTmp := &Meta{}
+
 	err := node.RPCFindSuccessor(&Meta{
-		Id:   node.fingerStart(rndIndex),
+		Id:   new(IDType).Set(node.fingerStart[node.fixIndex]),
 		Addr: "",
 	}, sucTmp)
 	if err != nil {
@@ -380,7 +544,9 @@ func (node *Node) FixFingers() error {
 	}
 	node.fingerTableLock.Lock()
 	defer node.fingerTableLock.Unlock()
-	node.fingerTable[rndIndex].Set(sucTmp)
+	node.fingerTable[node.fixIndex].Set(sucTmp)
+	node.fixIndex++
+	node.fixIndex %= int64(M)
 	return nil
 }
 
@@ -402,18 +568,52 @@ func (node *Node) RPCCopyToBackup(data map[string]string, _ *struct{}) error {
 	return nil
 }
 
+func (node *Node) RPCRemoveFromBackup(data map[string]string, _ *struct{}) error {
+	node.backupLock.Lock()
+	defer node.backupLock.Unlock()
+	for k := range data {
+		delete(node.backup, k)
+	}
+	return nil
+}
+
+func (node *Node) RPCSetBackup(data map[string]string, _ *struct{}) error {
+	node.backupLock.Lock()
+	defer node.backupLock.Unlock()
+	node.backup = make(map[string]string)
+	for k, v := range data {
+		node.backup[k] = v
+	}
+	return nil
+}
+
 func (node *Node) StartStabilize() {
 	go func() {
-		for node.online {
+		for {
+			node.onlineLock.RLock()
+			if !node.online {
+				node.onlineLock.RUnlock()
+				return
+			}
+			node.onlineLock.RUnlock()
+
+			node.block.Lock()
 			err := node.Stabilize()
 			if err != nil {
 				return
 			}
+			node.block.Unlock()
 			time.Sleep(StabilizeTime)
 		}
 	}()
 	go func() {
-		for node.online {
+		for {
+			node.onlineLock.RLock()
+			if !node.online {
+				node.onlineLock.RUnlock()
+				return
+			}
+			node.onlineLock.RUnlock()
 			err := node.FixFingers()
 			if err != nil {
 				return
@@ -423,13 +623,13 @@ func (node *Node) StartStabilize() {
 	}()
 }
 
-func (node *Node) RPCPutInData(pair *Pair, _ *struct{}) error {
+func (node *Node) RPCPutInData(pair Pair, _ *struct{}) error {
 	node.dataLock.Lock()
 	defer node.dataLock.Unlock()
 	node.data[pair.Key] = pair.Value
 	return nil
 }
-func (node *Node) RPCPutInBackUp(pair *Pair, _ *struct{}) error {
+func (node *Node) RPCPutInBackup(pair Pair, _ *struct{}) error {
 	node.backupLock.Lock()
 	defer node.backupLock.Unlock()
 	node.backup[pair.Key] = pair.Value
@@ -460,37 +660,21 @@ func (node *Node) RPCDeleteInBackup(key string, _ *struct{}) error {
 	}
 }
 
-func (node *Node) TransferData(meta *Meta, _ *struct{}) error { // 将node的部分数据转移到它的前驱meta
-	data := map[string]string{}
-	node.dataLock.RLock()
-	for k, v := range node.data {
-		if !inRangeOC(hashString(k), meta.Id, node.meta.Id) {
-			data[k] = v
-		}
+func (node *Node) RPCSetSuccessorList(list [R]*Meta, _ *struct{}) error {
+	node.successorListLock.Lock()
+	for i, v := range list {
+		node.successorList[i].Set(v)
 	}
-	node.dataLock.RUnlock()
-	node.dataLock.Lock()
-	for k := range data {
-		delete(node.data, k)
-	}
-	node.dataLock.Unlock()
-
-	err := node.RemoteCall(meta.Addr, "Node.RPCCopyToData", data, nil)
-	if err != nil {
-		return err
-	}
-	node.backupLock.Lock()
-	node.backup = make(map[string]string)
-	for k, v := range data {
-		node.backup[k] = v
-	}
-	node.backupLock.Unlock()
+	node.successorListLock.Unlock()
 	return nil
 }
 
-//
-// DHT methods
-//
+func (node *Node) RPCSetPredecessor(pred *Meta, _ *struct{}) error {
+	node.predecessorLock.Lock()
+	node.predecessor.Set(pred)
+	node.predecessorLock.Unlock()
+	return nil
+}
 
 func (node *Node) Run() {
 	node.server = rpc.NewServer()
@@ -505,7 +689,7 @@ func (node *Node) Run() {
 	node.onlineLock.Lock()
 	node.online = true
 	node.onlineLock.Unlock()
-	logrus.Info("Run successfully. ", node.meta.Addr)
+	//logrus.Info("Run successfully. ", node.meta.Addr)
 	go func() {
 		for node.online {
 			conn, err := node.listener.Accept()
@@ -519,16 +703,16 @@ func (node *Node) Run() {
 }
 func (node *Node) Create() {
 	node.fingerTableLock.Lock()
-	//for i := 0; i < M; i++ {
-	//	node.fingerTable[i].Set(node.meta)
-	//}
-	node.fingerTable[0].Set(node.meta)
+	for i := 0; i < M; i++ {
+		node.fingerTable[i].Set(node.meta)
+	}
+	//node.fingerTable[0].Set(node.meta)
 	node.fingerTableLock.Unlock()
 	node.successorListLock.Lock()
-	//for i := 0; i < R; i++ {
-	//	node.successorList[i].Set(node.meta)
-	//}
-	node.successorList[0].Set(node.meta)
+	for i := 0; i < R; i++ {
+		node.successorList[i].Set(node.meta)
+	}
+	//node.successorList[0].Set(node.meta)
 	node.successorListLock.Unlock()
 	node.predecessorLock.Lock()
 	node.predecessor.Set(node.meta)
@@ -538,13 +722,12 @@ func (node *Node) Create() {
 }
 
 func (node *Node) Join(addr string) bool {
-	logrus.Info("I am node: ", node.meta.Addr, " now I am trying to Join! Haha.")
-	if !node.TryPing(addr) {
-		logrus.Errorf("Join failed. With failure on Addr: %v", addr)
-		return false
-	}
+	logrus.Info("I am node: ", node.meta.Addr, " now I am trying to Join! With help of: ", addr)
+
 	suc := &Meta{}
+	logrus.Infof("[%s] Joining. RPCFindSuccessor begins.", node.meta.Addr)
 	err := node.RemoteCall(addr, "Node.RPCFindSuccessor", node.meta, suc)
+	logrus.Infof("[%s] Joining. RPCFindSuccessor ends. suc: %s", node.meta.Addr, suc.Addr)
 	if err != nil {
 		logrus.Errorf("Join failed when trying to Node.RPCFindSuccessor")
 		return false
@@ -559,81 +742,110 @@ func (node *Node) Join(addr string) bool {
 	node.successorList[0].Set(suc)
 	node.successorListLock.Unlock()
 	list := &[R]*Meta{}
+	logrus.Infof("[%s] Joining. RPCGetSucList begins.", node.meta.Addr)
 	err = node.RemoteCall(suc.Addr, "Node.RPCGetSucList", struct{}{}, list)
 	if err != nil {
 		logrus.Errorf("Join failed when trying to Node.RPCGetSucList")
 		return false
-	} else {
-		//logrus.Info("Node: ", node.meta.Addr, "successfully gets the sucList of node: ", suc.Addr)
 	}
+	logrus.Infof("[%s] Joining. RPCGetSucList ends.", node.meta.Addr)
 	node.successorListLock.Lock()
 	for i := 1; i < R; i++ {
 		node.successorList[i].Set(list[i-1])
 	}
 	node.successorListLock.Unlock()
-	err = node.RemoteCall(suc.Addr, "Node.TransferData", node.meta, nil)
-	if err != nil {
-		logrus.Errorf("Join failed when trying to Node.TransferData")
-	}
 	node.StartStabilize()
-	logrus.Infof("[Info] Node: %v joined by Addr: %v successfully.", node.meta.Addr, addr)
+	logrus.Infof("Node: %v joined by Addr: %v successfully.", node.meta.Addr, addr)
 	return true
 }
 func (node *Node) Quit() {
-	node.onlineLock.Lock()
 	if !node.online {
-		node.onlineLock.Unlock()
 		return
 	}
-	err := node.listener.Close()
+
+	node.block.Lock()
+	list := [R]*Meta{}
+	err := node.RPCGetSucList(struct{}{}, &list)
 	if err != nil {
-		logrus.Error("Quit failed: ", node.meta.Addr, err)
+		logrus.Error("GetSucList failed.")
 	}
+	suc := list[0]
+
+	backup := make(map[string]string)
+	node.backupLock.RLock()
+	for k, v := range node.backup {
+		backup[k] = v
+	}
+	node.backupLock.RUnlock()
+
+	logrus.Infof("[%s] Quit. RPCTransferForQuit begins.", node.meta.Addr)
+	err = node.RemoteCall(suc.Addr, "Node.RPCTransferForQuit", backup, nil)
+	logrus.Infof("[%s] Quit. RPCTransferForQuit ends.", node.meta.Addr)
+
+	node.predecessorLock.RLock()
+	pred := node.predecessor
+	node.predecessorLock.RUnlock()
+
+	err = node.RemoteCall(pred.Addr, "Node.RPCSetSuccessorList", list, nil)
+
+	err = node.RemoteCall(suc.Addr, "Node.RPCSetPredecessor", pred, nil)
+
+	err = node.listener.Close()
+	node.onlineLock.Lock()
 	node.online = false
 	node.onlineLock.Unlock()
+	logrus.Infof("[%s] Quit successfully", node.meta.Addr)
 }
 func (node *Node) ForceQuit() {
-	node.onlineLock.Lock()
 	if !node.online {
-		node.onlineLock.Unlock()
 		return
 	}
 	err := node.listener.Close()
 	if err != nil {
 		logrus.Error("Quit failed: ", node.meta.Addr, err)
 	}
+	node.onlineLock.Lock()
 	node.online = false
 	node.onlineLock.Unlock()
 }
 func (node *Node) Put(key string, value string) bool {
+	//logrus.Infof("[%s] Put begins %v, %v", node.meta.Addr, key, value)
 	meta := &Meta{
-		Addr: key,
+		Addr: "",
 		Id:   hashString(key),
 	}
 	suc := &Meta{}
+	logrus.Infof("[%s] Put. RPCFindSuccessor begins.", node.meta.Addr)
 	err := node.RPCFindSuccessor(meta, suc)
+	logrus.Infof("[%s] Put. RPCFindSuccessor ends. suc: %s", node.meta.Addr, suc.Addr)
 	if err != nil {
 		return false
 	}
-	pair := &Pair{
+	pair := Pair{
 		Key:   key,
 		Value: value,
 	}
+	logrus.Infof("[%s] Put. RPCPutInData begins", node.meta.Addr)
 	err = node.RemoteCall(suc.Addr, "Node.RPCPutInData", pair, nil)
 	if err != nil {
 		return false
 	}
+	logrus.Infof("[%s] Put. RPCPutInData ends", node.meta.Addr)
 	sucSuc := &Meta{}
+	logrus.Infof("[%s] Put. RPCGetSuccessor begins. suc: %s, sucSuc: %s", node.meta.Addr, suc.Addr, sucSuc.Addr)
 	err = node.RemoteCall(suc.Addr, "Node.RPCGetSuccessor", struct{}{}, sucSuc)
+	logrus.Infof("[%s] Put. RPCGetSuccessor ends. suc: %s, sucSuc: %s", node.meta.Addr, suc.Addr, sucSuc.Addr)
 	if err != nil {
-		logrus.Error("Put failed when trying to Node.RPCGetSuccessor")
+		//logrus.Error("Put failed when trying to Node.RPCGetSuccessor")
 	} else {
+		logrus.Infof("[%s] Put. RPCPutInBackup begins. suc: %s, sucSuc: %s", node.meta.Addr, suc.Addr, sucSuc.Addr)
 		err = node.RemoteCall(sucSuc.Addr, "Node.RPCPutInBackup", pair, nil)
+		logrus.Infof("[%s] Put. RPCPutInBackup ends. suc: %s, sucSuc: %s", node.meta.Addr, suc.Addr, sucSuc.Addr)
 		if err != nil {
-			logrus.Error("Put failed when trying to Node.RPCPutInBackup")
+			logrus.Error("Put failed when trying to Node.RPCPutInBackup.")
 		}
 	}
-	logrus.Info("Put key: ", key, " successfully on node: ", node.meta.Addr)
+	logrus.Infof("[%s] Put key: %v successfully. suc: %s, sucSuc: %s", node.meta.Addr, key, suc.Addr, sucSuc.Addr)
 	return true
 }
 func (node *Node) Get(key string) (ok bool, v string) {
@@ -642,16 +854,22 @@ func (node *Node) Get(key string) (ok bool, v string) {
 		Addr: "",
 	}
 	suc := &Meta{}
+	//logrus.Infof("[%s] Get. RPCFindSuccessor begins", node.meta.Addr)
 	err := node.RPCFindSuccessor(meta, suc)
+	//logrus.Infof("[%s] Get. RPCFindSuccessor ends. suc: %s", node.meta.Addr, suc.Addr)
 	if err != nil {
 		ok = false
 		v = ""
+		logrus.Errorf("[%s] Get failed when trying to find the successor of key: %v", node.meta.Addr, key)
 		return
 	}
+	//logrus.Infof("[%s] Get. RPCGetValue begins", node.meta.Addr)
 	err = node.RemoteCall(suc.Addr, "Node.RPCGetValue", key, &v)
+	//logrus.Infof("[%s] Get. RPCGetValue ends", node.meta.Addr)
 	if err != nil {
 		ok = false
 		v = ""
+		logrus.Errorf("[%s] Get failed when trying to RPCGetValue from: %s", node.meta.Addr, suc.Addr)
 		return
 	}
 	ok = true
@@ -674,13 +892,13 @@ func (node *Node) Delete(key string) bool {
 	sucSuc := &Meta{}
 	err = node.RemoteCall(suc.Addr, "Node.RPCGetSuccessor", struct{}{}, sucSuc)
 	if err != nil {
-		logrus.Error("Delete failed when trying to Node.RPCGetSuccessor")
+		//logrus.Error("Delete failed when trying to Node.RPCGetSuccessor")
 	} else {
 		err = node.RemoteCall(sucSuc.Addr, "Node.RPCDeleteInBackup", key, nil)
 		if err != nil {
-			logrus.Error("Delete failed when trying to Node.RPCPutInBackup")
+			logrus.Error("Delete failed when trying to Node.RPCDeleteInBackup")
 		}
 	}
-	logrus.Info("Delete key: ", key, " successfully on node: ", node.meta.Addr)
+	logrus.Infof("[%s] Delete key: %v successfully. suc: %s, sucSuc: %s", node.meta.Addr, key, suc.Addr, sucSuc.Addr)
 	return true
 }
