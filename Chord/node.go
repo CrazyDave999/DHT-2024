@@ -3,11 +3,10 @@ package Chord
 import (
 	"crypto/sha1"
 	"fmt"
-	"github.com/sirupsen/logrus"
+	//"github.com/sirupsen/logrus"
 	"math/big"
 	"net"
 	"net/rpc"
-	"os"
 	"sync"
 	"time"
 )
@@ -15,8 +14,8 @@ import (
 func init() {
 	// You can use the logrus package to print pretty logs.
 	// Here we set the log output to a file.
-	f, _ := os.Create("dht-chord-test.log")
-	logrus.SetOutput(f)
+	//f, _ := os.Create("dht-chord-test.log")
+	//logrus.SetOutput(f)
 }
 
 const (
@@ -64,10 +63,9 @@ type Node struct {
 	predecessorLock   sync.RWMutex
 	fingerTable       [M]*Meta
 	fingerTableLock   sync.RWMutex
-	//quit              chan bool
-	fixIndex    int64
-	fingerStart [M]*IDType
-	block       sync.Mutex
+	fixIndex          int64
+	fingerStart       [M]*IDType
+	block             sync.Mutex
 }
 type Pair struct {
 	Key   string
@@ -115,6 +113,15 @@ func inRangeCO(x *IDType, a *IDType, b *IDType) bool {
 	return !inRangeCO(x, b, a)
 }
 
+func (node *Node) LockBlock(_ struct{}, _ *struct{}) error {
+	node.block.Lock()
+	return nil
+}
+func (node *Node) UnLockBlock(_ struct{}, _ *struct{}) error {
+	node.block.Unlock()
+	return nil
+}
+
 func (node *Node) Init(addr string) {
 	node.meta = &Meta{
 		Id:   hashString(addr),
@@ -135,8 +142,11 @@ func (node *Node) Init(addr string) {
 	}
 
 	for i := 0; i < M; i++ {
-		node.fingerTable[i] = new(Meta).Set(node.meta)
-		node.fingerStart[i] = new(IDType).Add(node.meta.Id, new(IDType).Exp(big.NewInt(2), big.NewInt(int64(i)), nil))
+		node.fingerTable[i] = &Meta{
+			Id:   new(IDType),
+			Addr: "",
+		}
+		node.fingerStart[i] = new(IDType).Mod(new(IDType).Add(node.meta.Id, new(IDType).Exp(big.NewInt(2), big.NewInt(int64(i)), nil)), LENGTH)
 	}
 	//node.quit = make(chan bool, 1)
 	node.fixIndex = 0
@@ -144,20 +154,16 @@ func (node *Node) Init(addr string) {
 
 // RemoteCall calls the RPC method at Addr
 func (node *Node) RemoteCall(addr string, method string, args interface{}, reply interface{}) error {
-	//if method != "Node.Ping" {
-	//	logrus.Infof("[%s] RemoteCall %s %s %v", node.meta.Addr, addr, method, args)
-	//}
-	// Note: Here we use DialTimeout to set a timeout of 10 seconds.
 	conn, err := net.DialTimeout("tcp", addr, PingTime)
 	if err != nil {
-		logrus.Errorf("[%s] dialing: %s, %s", node.meta.Addr, addr, err)
+		//logrus.Errorf("[%s] dialing: %s, %s", node.meta.Addr, addr, err)
 		return err
 	}
 	client := rpc.NewClient(conn)
 	defer client.Close()
 	err = client.Call(method, args, reply)
 	if err != nil {
-		logrus.Error("RemoteCall error: ", err)
+		//logrus.Errorf("[%s] RemoteCall error: %s", node.meta.Addr, err)
 		return err
 	}
 	return nil
@@ -168,6 +174,10 @@ func (node *Node) RemoteCall(addr string, method string, args interface{}, reply
 //
 
 func (node *Node) Ping(_ struct{}, _ *struct{}) error {
+	if !node.online {
+
+		return fmt.Errorf("damn! offline")
+	}
 	return nil
 }
 func (node *Node) TryPing(addr string) bool {
@@ -177,11 +187,22 @@ func (node *Node) TryPing(addr string) bool {
 
 func (node *Node) RPCGetValue(key string, reply *string) error {
 	node.dataLock.RLock()
-	defer node.dataLock.RUnlock()
 	v, ok := node.data[key]
+	node.dataLock.RUnlock()
 	if ok {
 		*reply = v
 		return nil
+	}
+	suc := &Meta{}
+	err := node.RPCGetSuccessor(struct{}{}, suc)
+	if err == nil && suc.Addr == node.meta.Addr {
+		node.backupLock.RLock()
+		v, ok = node.backup[key]
+		node.backupLock.RUnlock()
+		if ok {
+			*reply = v
+			return nil
+		}
 	}
 	*reply = ""
 	return fmt.Errorf("[%s] RPCGetValue. Failed getting key: %v. No such data exists", node.meta.Addr, key)
@@ -253,7 +274,7 @@ func (node *Node) RPCFindSuccessor(meta *Meta, reply *Meta) error {
 	//logrus.Infof("[%s] RPCFindSuccessor. RPCGetSuccessor begins.", node.meta.Addr)
 	err := node.RPCGetSuccessor(struct{}{}, suc)
 	if err != nil {
-		logrus.Errorf("RPCFindSuccessor failed when trying to RPCGetSuccessor")
+		//logrus.Errorf("RPCFindSuccessor failed when trying to RPCGetSuccessor")
 		return err
 	}
 	//logrus.Infof("[%s] RPCFindSuccessor. RPCGetSuccessor ends.", node.meta.Addr)
@@ -262,44 +283,37 @@ func (node *Node) RPCFindSuccessor(meta *Meta, reply *Meta) error {
 		return nil
 	}
 	pred := &Meta{}
-	logrus.Infof("[%s] RPCFindSuccessor. RPCFindPredecessor begins.", node.meta.Addr)
+	//logrus.Infof("[%s] RPCFindSuccessor. RPCFindPredecessor begins.", node.meta.Addr)
 	err = node.RPCFindPredecessor(meta, pred)
 	if err != nil {
-		logrus.Errorf("RPCFindSuccessor failed when trying to RPCFindPredecessor")
+		//logrus.Errorf("RPCFindSuccessor failed when trying to RPCFindPredecessor")
 		return err
 	}
-	logrus.Infof("[%s] RPCFindSuccessor. RPCFindPredecessor ends.", node.meta.Addr)
+	//logrus.Infof("[%s] RPCFindSuccessor. RPCFindPredecessor ends. pred: %s", node.meta.Addr, pred.Addr)
 	//logrus.Infof("[%s] RPCFindSuccessor. RPCGetSuccessor begins.", node.meta.Addr)
 	err = node.RemoteCall(pred.Addr, "Node.RPCGetSuccessor", struct{}{}, reply)
 	//logrus.Infof("[%s] RPCFindSuccessor. RPCGetSuccessor ends.", node.meta.Addr)
 	return err
 }
 func (node *Node) RPCFindPredecessor(meta *Meta, reply *Meta) error {
-	logrus.Infof("[%s] RPCFindPredecessor. meta: %s", node.meta.Addr, meta.Addr)
+	//logrus.Infof("[%s] RPCFindPredecessor. meta: %s", node.meta.Addr, meta.Addr)
 	pred := (&Meta{}).Set(node.meta)
 	suc := &Meta{}
 	err := node.RPCGetSuccessor(struct{}{}, suc)
 	if err != nil {
 		return err
 	}
-	if meta.Id.Cmp(node.meta.Id) == 0 || inRangeOC(meta.Id, node.meta.Id, suc.Id) {
+	if inRangeOC(meta.Id, node.meta.Id, suc.Id) {
 		reply.Set(node.meta)
 		return nil
 	} else {
-		logrus.Infof("[%s] RPCFindPredecessor. RPCClosestPrecedingFinger begins. meta: %s", node.meta.Addr, meta.Addr)
+		//logrus.Infof("[%s] RPCFindPredecessor. RPCClosestPrecedingFinger begins. meta: %s", node.meta.Addr, meta.Addr)
 		err = node.RPCClosestPrecedingFinger(meta, pred)
-		logrus.Infof("[%s] RPCFindPredecessor. RPCClosestPrecedingFinger ends. meta: %s, pred: %s", node.meta.Addr, meta.Addr, pred.Addr)
+		//logrus.Infof("[%s] RPCFindPredecessor. RPCClosestPrecedingFinger ends. meta: %s, pred: %s", node.meta.Addr, meta.Addr, pred.Addr)
 		if err != nil {
-			logrus.Errorf("[%s] RPCFindPredecessor. RPCClosestPrecedingFinger failed. meta: %s", node.meta.Addr, meta.Addr)
+			//logrus.Errorf("[%s] RPCFindPredecessor. RPCClosestPrecedingFinger failed. meta: %s", node.meta.Addr, meta.Addr)
 			return err
 		}
-
-		////logrus.Infof("[%s] RPCFindPredecessor. RPCGetSuccessor begins", node.meta.Addr)
-		//err = node.RemoteCall(pred.Addr, "Node.RPCGetSuccessor", struct{}{}, suc)
-		////logrus.Infof("[%s] RPCFindPredecessor. RPCGetSuccessor ends", node.meta.Addr)
-		//if err != nil {
-		//	return err
-		//}
 		return node.RemoteCall(pred.Addr, "Node.RPCFindPredecessor", meta, reply)
 	}
 }
@@ -325,7 +339,7 @@ func (node *Node) Stabilize() error {
 	//logrus.Infof("[%s] Stabilize. RPCGetSuccessor begins", node.meta.Addr)
 	err := node.RPCGetSuccessor(struct{}{}, suc)
 	if err != nil {
-		logrus.Errorf("Stabilization failed when trying to node.RPCGetSuccessor")
+		//logrus.Errorf("[%s] Stabilization failed when trying to node.RPCGetSuccessor", node.meta.Addr)
 		return err
 	}
 	//logrus.Infof("[%s] Stabilize. RPCGetSuccessor ends. suc: %s", node.meta.Addr, suc.Addr)
@@ -333,7 +347,7 @@ func (node *Node) Stabilize() error {
 	//logrus.Infof("[%s] Stabilize RPCGetPredecessor begins", node.meta.Addr)
 	err = node.RemoteCall(suc.Addr, "Node.RPCGetPredecessor", struct{}{}, pred)
 	if err != nil {
-		logrus.Errorf("Stabilization failed when trying to RPCGetPredecessor")
+		//logrus.Errorf("[%s] Stabilization failed when trying to RPCGetPredecessor. suc: %s", node.meta.Addr, suc.Addr)
 		return err
 	}
 	//logrus.Infof("[%s] Stabilize RPCGetPredecessor ends. pred: %s", node.meta.Addr, pred.Addr)
@@ -349,14 +363,24 @@ func (node *Node) Stabilize() error {
 		}
 		suc = node.successorList[0].Set(pred)
 		node.successorListLock.Unlock()
+		node.fingerTableLock.Lock()
+		node.fingerTable[0].Set(suc)
+		node.fingerTableLock.Unlock()
 	} else {
 		node.successorListLock.Lock()
 		if suc.Addr != node.successorList[0].Addr {
 			node.successorList[0].Set(suc)
 			node.successorListLock.Unlock()
-			node.backupLock.RLock()
-			err = node.RemoteCall(suc.Addr, "Node.RPCTransferForSuccessorFail", node.backup, nil)
-			node.backupLock.RUnlock()
+			node.fingerTableLock.Lock()
+			node.fingerTable[0].Set(suc)
+			node.fingerTableLock.Unlock()
+			node.dataLock.RLock()
+			data := make(map[string]string)
+			for k, v := range node.data {
+				data[k] = v
+			}
+			node.dataLock.RUnlock()
+			err = node.RemoteCall(suc.Addr, "Node.RPCTransferForSuccessorFail", data, nil)
 		} else {
 			node.successorListLock.Unlock()
 		}
@@ -366,7 +390,7 @@ func (node *Node) Stabilize() error {
 		//logrus.Infof("[%s] RPCGetSucList begins", node.meta.Addr)
 		err = node.RemoteCall(suc.Addr, "Node.RPCGetSucList", struct{}{}, list)
 		if err != nil {
-			logrus.Errorf("Stabilization failed when trying to get suc's successorList")
+			//logrus.Errorf("[%s] Stabilization failed when trying to get suc's successorList", node.meta.Addr)
 			return err
 		}
 		//logrus.Infof("[%s] RPCGetSucList ends", node.meta.Addr)
@@ -380,21 +404,21 @@ func (node *Node) Stabilize() error {
 	err = node.RemoteCall(suc.Addr, "Node.RPCNotify", node.meta, nil)
 
 	if err != nil {
-		logrus.Errorf("Stabilization failed when trying to Node.RPCNotify")
+		//logrus.Errorf("Stabilization failed when trying to Node.RPCNotify")
 		return err
 	}
 
-	node.successorListLock.RLock()
-	sucList := [R]string{}
-	for i := 0; i < R; i++ {
-		l := len(node.successorList[i].Addr)
-		if l < 2 {
-			continue
-		}
-		sucList[i] = node.successorList[i].Addr[l-2:]
-	}
-	node.successorListLock.RUnlock()
-	logrus.Infof("[%s] sucList: %s", node.meta.Addr, sucList)
+	//node.successorListLock.RLock()
+	//sucList := [R]string{}
+	//for i := 0; i < R; i++ {
+	//	l := len(node.successorList[i].Addr)
+	//	if l < 2 {
+	//		continue
+	//	}
+	//	sucList[i] = node.successorList[i].Addr[l-2:]
+	//}
+	//node.successorListLock.RUnlock()
+	//logrus.Infof("[%s] sucList: %s", node.meta.Addr, sucList)
 
 	return nil
 }
@@ -408,6 +432,7 @@ func (node *Node) RPCTransferForQuit(backup map[string]string, _ *struct{}) erro
 	}
 	node.backupLock.RUnlock()
 	node.dataLock.Lock()
+	//logrus.Infof("[%s] RPCTransferForQuit. node.data: %s, node.backup: %s, backup: %s", node.meta.Addr, node.data, data, backup)
 	for k, v := range data {
 		node.data[k] = v
 	}
@@ -600,7 +625,7 @@ func (node *Node) StartStabilize() {
 			node.block.Lock()
 			err := node.Stabilize()
 			if err != nil {
-				return
+				//return
 			}
 			node.block.Unlock()
 			time.Sleep(StabilizeTime)
@@ -616,7 +641,7 @@ func (node *Node) StartStabilize() {
 			node.onlineLock.RUnlock()
 			err := node.FixFingers()
 			if err != nil {
-				return
+				//return
 			}
 			time.Sleep(StabilizeTime)
 		}
@@ -666,6 +691,9 @@ func (node *Node) RPCSetSuccessorList(list [R]*Meta, _ *struct{}) error {
 		node.successorList[i].Set(v)
 	}
 	node.successorListLock.Unlock()
+	node.fingerTableLock.Lock()
+	node.fingerTable[0].Set(list[0])
+	node.fingerTableLock.Unlock()
 	return nil
 }
 
@@ -684,7 +712,7 @@ func (node *Node) Run() {
 	}
 	node.listener, err = net.Listen("tcp", node.meta.Addr)
 	if err != nil {
-		logrus.Fatal("listen error: ", err)
+		//logrus.Fatal("listen error: ", err)
 	}
 	node.onlineLock.Lock()
 	node.online = true
@@ -694,7 +722,7 @@ func (node *Node) Run() {
 		for node.online {
 			conn, err := node.listener.Accept()
 			if err != nil {
-				logrus.Error("accept error: ", err)
+				//logrus.Error("accept error: ", err)
 				return
 			}
 			go node.server.ServeConn(conn)
@@ -718,18 +746,18 @@ func (node *Node) Create() {
 	node.predecessor.Set(node.meta)
 	node.predecessorLock.Unlock()
 	node.StartStabilize()
-	logrus.Info("[Info] Hello from CrazyDave. Your network has been created successfully!")
+	//logrus.Info("[Info] Hello from CrazyDave. Your network has been created successfully!")
 }
 
 func (node *Node) Join(addr string) bool {
-	logrus.Info("I am node: ", node.meta.Addr, " now I am trying to Join! With help of: ", addr)
+	//logrus.Info("I am node: ", node.meta.Addr, " now I am trying to Join! With help of: ", addr)
 
 	suc := &Meta{}
-	logrus.Infof("[%s] Joining. RPCFindSuccessor begins.", node.meta.Addr)
+	//logrus.Infof("[%s] Joining. RPCFindSuccessor begins.", node.meta.Addr)
 	err := node.RemoteCall(addr, "Node.RPCFindSuccessor", node.meta, suc)
-	logrus.Infof("[%s] Joining. RPCFindSuccessor ends. suc: %s", node.meta.Addr, suc.Addr)
+	//logrus.Infof("[%s] Joining. RPCFindSuccessor ends. suc: %s", node.meta.Addr, suc.Addr)
 	if err != nil {
-		logrus.Errorf("Join failed when trying to Node.RPCFindSuccessor")
+		//logrus.Errorf("Join failed when trying to Node.RPCFindSuccessor")
 		return false
 	}
 	node.predecessorLock.Lock()
@@ -742,20 +770,20 @@ func (node *Node) Join(addr string) bool {
 	node.successorList[0].Set(suc)
 	node.successorListLock.Unlock()
 	list := &[R]*Meta{}
-	logrus.Infof("[%s] Joining. RPCGetSucList begins.", node.meta.Addr)
+	//logrus.Infof("[%s] Joining. RPCGetSucList begins.", node.meta.Addr)
 	err = node.RemoteCall(suc.Addr, "Node.RPCGetSucList", struct{}{}, list)
 	if err != nil {
-		logrus.Errorf("Join failed when trying to Node.RPCGetSucList")
+		//logrus.Errorf("Join failed when trying to Node.RPCGetSucList")
 		return false
 	}
-	logrus.Infof("[%s] Joining. RPCGetSucList ends.", node.meta.Addr)
+	//logrus.Infof("[%s] Joining. RPCGetSucList ends.", node.meta.Addr)
 	node.successorListLock.Lock()
 	for i := 1; i < R; i++ {
 		node.successorList[i].Set(list[i-1])
 	}
 	node.successorListLock.Unlock()
 	node.StartStabilize()
-	logrus.Infof("Node: %v joined by Addr: %v successfully.", node.meta.Addr, addr)
+	//logrus.Infof("Node: %v joined by Addr: %v successfully.", node.meta.Addr, addr)
 	return true
 }
 func (node *Node) Quit() {
@@ -765,11 +793,30 @@ func (node *Node) Quit() {
 
 	node.block.Lock()
 	list := [R]*Meta{}
+	//logrus.Infof("[%s] Quit. RPCGetSucList begins.", node.meta.Addr)
 	err := node.RPCGetSucList(struct{}{}, &list)
 	if err != nil {
-		logrus.Error("GetSucList failed.")
+		//logrus.Error("GetSucList failed.")
 	}
+	//logrus.Infof("[%s] Quit. RPCGetSucList ends.", node.meta.Addr)
 	suc := list[0]
+	node.predecessorLock.RLock()
+	pred := node.predecessor
+	if pred.Addr != "" && !node.TryPing(pred.Addr) {
+		pred.Addr = ""
+	}
+	node.predecessorLock.RUnlock()
+
+	if suc.Addr != node.meta.Addr {
+		//logrus.Infof("[%s] Quit. LockBlock begins. suc: %s", node.meta.Addr, suc.Addr)
+		err = node.RemoteCall(suc.Addr, "Node.LockBlock", struct{}{}, nil)
+		//logrus.Infof("[%s] Quit. LockBlock ends. suc: %s", node.meta.Addr, suc.Addr)
+	}
+	if pred.Addr != "" && pred.Addr != node.meta.Addr && pred.Addr != suc.Addr {
+		//logrus.Infof("[%s] Quit. LockBlock begins. pred: %s", node.meta.Addr, pred.Addr)
+		err = node.RemoteCall(pred.Addr, "Node.LockBlock", struct{}{}, nil)
+		//logrus.Infof("[%s] Quit. LockBlock ends. pred: %s", node.meta.Addr, pred.Addr)
+	}
 
 	backup := make(map[string]string)
 	node.backupLock.RLock()
@@ -778,13 +825,9 @@ func (node *Node) Quit() {
 	}
 	node.backupLock.RUnlock()
 
-	logrus.Infof("[%s] Quit. RPCTransferForQuit begins.", node.meta.Addr)
+	//logrus.Infof("[%s] Quit. RPCTransferForQuit begins. suc: %s, pred: %s, ", node.meta.Addr, suc.Addr, pred.Addr)
 	err = node.RemoteCall(suc.Addr, "Node.RPCTransferForQuit", backup, nil)
-	logrus.Infof("[%s] Quit. RPCTransferForQuit ends.", node.meta.Addr)
-
-	node.predecessorLock.RLock()
-	pred := node.predecessor
-	node.predecessorLock.RUnlock()
+	//logrus.Infof("[%s] Quit. RPCTransferForQuit ends. suc: %s, pred: %s", node.meta.Addr, suc.Addr, pred.Addr)
 
 	err = node.RemoteCall(pred.Addr, "Node.RPCSetSuccessorList", list, nil)
 
@@ -794,7 +837,13 @@ func (node *Node) Quit() {
 	node.onlineLock.Lock()
 	node.online = false
 	node.onlineLock.Unlock()
-	logrus.Infof("[%s] Quit successfully", node.meta.Addr)
+	if suc.Addr != node.meta.Addr {
+		err = node.RemoteCall(suc.Addr, "Node.UnLockBlock", struct{}{}, nil)
+	}
+	if pred.Addr != "" && pred.Addr != node.meta.Addr && pred.Addr != suc.Addr {
+		err = node.RemoteCall(pred.Addr, "Node.UnLockBlock", struct{}{}, nil)
+	}
+	//logrus.Infof("[%s] Quit successfully.", node.meta.Addr)
 }
 func (node *Node) ForceQuit() {
 	if !node.online {
@@ -802,11 +851,12 @@ func (node *Node) ForceQuit() {
 	}
 	err := node.listener.Close()
 	if err != nil {
-		logrus.Error("Quit failed: ", node.meta.Addr, err)
+		//logrus.Error("Quit failed: ", node.meta.Addr, err)
 	}
 	node.onlineLock.Lock()
 	node.online = false
 	node.onlineLock.Unlock()
+	//logrus.Infof("[%s] ForceQuit successfully.", node.meta.Addr)
 }
 func (node *Node) Put(key string, value string) bool {
 	//logrus.Infof("[%s] Put begins %v, %v", node.meta.Addr, key, value)
@@ -815,37 +865,39 @@ func (node *Node) Put(key string, value string) bool {
 		Id:   hashString(key),
 	}
 	suc := &Meta{}
-	logrus.Infof("[%s] Put. RPCFindSuccessor begins.", node.meta.Addr)
+	//logrus.Infof("[%s] Put. RPCFindSuccessor begins.", node.meta.Addr)
 	err := node.RPCFindSuccessor(meta, suc)
-	logrus.Infof("[%s] Put. RPCFindSuccessor ends. suc: %s", node.meta.Addr, suc.Addr)
 	if err != nil {
+		//logrus.Errorf("[%s] Put. RPCFindSuccessor failed.", node.meta.Addr)
 		return false
 	}
+	//logrus.Infof("[%s] Put. RPCFindSuccessor ends. suc: %s", node.meta.Addr, suc.Addr)
 	pair := Pair{
 		Key:   key,
 		Value: value,
 	}
-	logrus.Infof("[%s] Put. RPCPutInData begins", node.meta.Addr)
+	//logrus.Infof("[%s] Put. RPCPutInData begins", node.meta.Addr)
 	err = node.RemoteCall(suc.Addr, "Node.RPCPutInData", pair, nil)
 	if err != nil {
+		//logrus.Errorf("[%s] Put. RPCPutInData failed.", node.meta.Addr)
 		return false
 	}
-	logrus.Infof("[%s] Put. RPCPutInData ends", node.meta.Addr)
+	//logrus.Infof("[%s] Put. RPCPutInData ends", node.meta.Addr)
 	sucSuc := &Meta{}
-	logrus.Infof("[%s] Put. RPCGetSuccessor begins. suc: %s, sucSuc: %s", node.meta.Addr, suc.Addr, sucSuc.Addr)
+	//logrus.Infof("[%s] Put. RPCGetSuccessor begins. suc: %s, sucSuc: %s", node.meta.Addr, suc.Addr, sucSuc.Addr)
 	err = node.RemoteCall(suc.Addr, "Node.RPCGetSuccessor", struct{}{}, sucSuc)
-	logrus.Infof("[%s] Put. RPCGetSuccessor ends. suc: %s, sucSuc: %s", node.meta.Addr, suc.Addr, sucSuc.Addr)
+	//logrus.Infof("[%s] Put. RPCGetSuccessor ends. suc: %s, sucSuc: %s", node.meta.Addr, suc.Addr, sucSuc.Addr)
 	if err != nil {
 		//logrus.Error("Put failed when trying to Node.RPCGetSuccessor")
 	} else {
-		logrus.Infof("[%s] Put. RPCPutInBackup begins. suc: %s, sucSuc: %s", node.meta.Addr, suc.Addr, sucSuc.Addr)
+		//logrus.Infof("[%s] Put. RPCPutInBackup begins. suc: %s, sucSuc: %s", node.meta.Addr, suc.Addr, sucSuc.Addr)
 		err = node.RemoteCall(sucSuc.Addr, "Node.RPCPutInBackup", pair, nil)
-		logrus.Infof("[%s] Put. RPCPutInBackup ends. suc: %s, sucSuc: %s", node.meta.Addr, suc.Addr, sucSuc.Addr)
+		//logrus.Infof("[%s] Put. RPCPutInBackup ends. suc: %s, sucSuc: %s", node.meta.Addr, suc.Addr, sucSuc.Addr)
 		if err != nil {
-			logrus.Error("Put failed when trying to Node.RPCPutInBackup.")
+			//logrus.Error("Put failed when trying to Node.RPCPutInBackup.")
 		}
 	}
-	logrus.Infof("[%s] Put key: %v successfully. suc: %s, sucSuc: %s", node.meta.Addr, key, suc.Addr, sucSuc.Addr)
+	//logrus.Infof("[%s] Put key: %v successfully. suc: %s, sucSuc: %s", node.meta.Addr, key, suc.Addr, sucSuc.Addr)
 	return true
 }
 func (node *Node) Get(key string) (ok bool, v string) {
@@ -860,7 +912,7 @@ func (node *Node) Get(key string) (ok bool, v string) {
 	if err != nil {
 		ok = false
 		v = ""
-		logrus.Errorf("[%s] Get failed when trying to find the successor of key: %v", node.meta.Addr, key)
+		//logrus.Errorf("[%s] Get failed when trying to find the successor of key: %v", node.meta.Addr, key)
 		return
 	}
 	//logrus.Infof("[%s] Get. RPCGetValue begins", node.meta.Addr)
@@ -869,7 +921,7 @@ func (node *Node) Get(key string) (ok bool, v string) {
 	if err != nil {
 		ok = false
 		v = ""
-		logrus.Errorf("[%s] Get failed when trying to RPCGetValue from: %s", node.meta.Addr, suc.Addr)
+		//logrus.Errorf("[%s] Get failed when trying to RPCGetValue from: %s", node.meta.Addr, suc.Addr)
 		return
 	}
 	ok = true
@@ -877,7 +929,7 @@ func (node *Node) Get(key string) (ok bool, v string) {
 }
 func (node *Node) Delete(key string) bool {
 	meta := &Meta{
-		Addr: key,
+		Addr: "",
 		Id:   hashString(key),
 	}
 	suc := &Meta{}
@@ -896,9 +948,9 @@ func (node *Node) Delete(key string) bool {
 	} else {
 		err = node.RemoteCall(sucSuc.Addr, "Node.RPCDeleteInBackup", key, nil)
 		if err != nil {
-			logrus.Error("Delete failed when trying to Node.RPCDeleteInBackup")
+			//logrus.Error("Delete failed when trying to Node.RPCDeleteInBackup")
 		}
 	}
-	logrus.Infof("[%s] Delete key: %v successfully. suc: %s, sucSuc: %s", node.meta.Addr, key, suc.Addr, sucSuc.Addr)
+	//logrus.Infof("[%s] Delete key: %v successfully. suc: %s, sucSuc: %s", node.meta.Addr, key, suc.Addr, sucSuc.Addr)
 	return true
 }
