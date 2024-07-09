@@ -1,7 +1,6 @@
 package Kademlia
 
 import (
-	"container/list"
 	"fmt"
 	"github.com/sirupsen/logrus"
 	"math/big"
@@ -34,25 +33,27 @@ func init() {
 	}
 }
 
-func RemoteCall(addr string, method string, args interface{}, reply interface{}) error {
-	conn, err := net.DialTimeout("tcp", addr, PingTime)
+func RemoteCall(ip string, method string, args interface{}, reply interface{}) error {
+	conn, err := net.DialTimeout("tcp", ip, PingTime)
 	if err != nil {
+		logrus.Errorf("Remote call failed. Dialing ip: %s, method: %s, error: %s", ip, method, err)
 		return err
 	}
 	client := rpc.NewClient(conn)
 	defer client.Close()
 	err = client.Call(method, args, reply)
 	if err != nil {
+		logrus.Errorf("Remote call failed. ip: %s, method: %s, error: %s", ip, method, err)
 		return err
 	}
 	return nil
 }
-func (node *Node) RemoteCall(addr string, method string, args interface{}, reply interface{}) error {
-	err := RemoteCall(addr, method, args, reply)
+func (node *Node) RemoteCall(ip string, method string, args interface{}, reply interface{}) error {
+	err := RemoteCall(ip, method, args, reply)
 
-	// piggy-backed update operation on the sender
+	// piggybacked update operation on the sender
 	if method != "Node.Ping" && method != "Node.Fetch" {
-		node.Update(addr, err == nil)
+		node.Update(ip, err == nil)
 	}
 	return err
 }
@@ -97,6 +98,9 @@ func (node *Node) Fetch(key string, value *string) error {
 }
 
 func (node *Node) Update(ip string, online bool) {
+	if ip == node.ip {
+		return
+	}
 	ind := node.WhichBucket(hashString(ip))
 	if ind != -1 {
 		node.rt.Update(ind, ip, online)
@@ -105,119 +109,137 @@ func (node *Node) Update(ip string, online bool) {
 
 // FindNode 返回自己路由表中距离id最近的k个节点ip
 func (node *Node) FindNode(id *big.Int, reply *[]string) error {
-	ind := node.WhichBucket(id)
-	if ind == -1 {
-		*reply = append(*reply, node.ip)
-	} else {
-		buc := node.rt.GetNodes(ind)
-		for _, v := range buc {
-			*reply = append(*reply, v)
+	var done chan bool
+	go func() {
+		ind := node.WhichBucket(id)
+		if ind == -1 {
+			*reply = append(*reply, node.ip)
+		} else {
+			buc := node.rt.GetNodes(ind)
+			for _, v := range buc {
+				*reply = append(*reply, v)
+			}
 		}
-	}
-	if len(*reply) == K {
+		if len(*reply) == K {
+			done <- true
+			return
+		}
+		for i := ind + 1; i < M; i++ {
+			buc := node.rt.GetNodes(i)
+			for _, v := range buc {
+				*reply = append(*reply, v)
+				if len(*reply) == K {
+					done <- true
+					return
+				}
+			}
+		}
+		for i := ind - 1; i >= 0; i-- {
+			buc := node.rt.GetNodes(i)
+			for _, v := range buc {
+				*reply = append(*reply, v)
+				if len(*reply) == K {
+					done <- true
+					return
+				}
+			}
+		}
+		if ind != -1 {
+			*reply = append(*reply, node.ip)
+		}
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-time.After(FindNodeTimeout):
 		return nil
 	}
-	for i := ind + 1; i < M; i++ {
-		buc := node.rt.GetNodes(i)
-		for _, v := range buc {
-			*reply = append(*reply, v)
-			if len(*reply) == K {
-				return nil
-			}
-		}
-	}
-	for i := ind - 1; i >= 0; i-- {
-		buc := node.rt.GetNodes(i)
-		for _, v := range buc {
-			*reply = append(*reply, v)
-			if len(*reply) == K {
-				return nil
-			}
-		}
-	}
-	if ind != -1 {
-		*reply = append(*reply, node.ip)
-	}
-	return nil
 }
 
 // NodeLookup 返回距离id最近的k个ip
 func (node *Node) NodeLookup(id *big.Int) (kClosest []string) {
 	var sl ShortList
 	sl.Init(id)
-	findList := make([]string, 0)
-	err := node.FindNode(id, &findList)
-	if err != nil {
-		return
-	}
-	for _, v := range findList {
-		sl.Insert(v)
-	}
+	done := make(chan bool)
+	go func() {
+		findList := make([]string, 0)
+		err := node.FindNode(id, &findList)
+		if err != nil {
+			return
+		}
+		for _, v := range findList {
+			sl.Insert(v)
+		}
 
-	// 每轮循环，从shortList中选取alpha个没有被询问过的，并发地对它们调用FindNode，得到的节点都加入到shortList
-	// 如果一个节点未能在规定时间内返回，则从shortList中移除
-	// 如果在一轮循环中最接近的节点未被改变，则对前k个中还没问过的全部节点执行FindNode
-	for {
-		queryList := sl.GetAlphaNotQueried()
-		findList = make([]string, 0)
-		node.MakeQuery(id, &queryList, &findList, &sl)
-		changed := sl.Update(findList)
-		if !changed {
-			queryList = sl.GetAllNotQueried()
+		// 每轮循环，从shortList中选取alpha个没有被询问过的，并发地对它们调用FindNode，得到的节点都加入到shortList
+		// 如果一个节点未能在规定时间内返回，则从shortList中移除
+		// 如果在一轮循环中最接近的节点未被改变，则对前k个中还没问过的全部节点执行FindNode
+		for {
+			queryList := sl.GetAlphaNotQueried()
 			findList = make([]string, 0)
 			node.MakeQuery(id, &queryList, &findList, &sl)
-			changed = sl.Update(findList)
+			changed := sl.Update(findList)
 			if !changed {
-				break
+				queryList = sl.GetAllNotQueried()
+				findList = make([]string, 0)
+				node.MakeQuery(id, &queryList, &findList, &sl)
+				changed = sl.Update(findList)
+				if !changed {
+					break
+				}
 			}
 		}
+		done <- true
+	}()
+	select {
+	case <-done:
+		return sl.GetKClosest()
+	case <-time.After(NodeLookupTimeout):
+		return sl.GetKClosest()
 	}
-	return sl.GetKClosest()
 }
 
-func (node *Node) MakeQuery(id *big.Int, queryList *[]*list.Element, findList *[]string, sl *ShortList) {
+func (node *Node) MakeQuery(id *big.Int, queryList *[]string, findList *[]string, sl *ShortList) {
 	var wg sync.WaitGroup
 	wg.Add(len(*queryList))
 	findListLock := sync.Mutex{}
-	for _, element := range *queryList {
-		ip := element.Value.(ShortListNode).ip
-		go func(e *list.Element) {
+	for _, ip := range *queryList {
+		go func(ip string) {
 			defer wg.Done()
-			reply := &[]string{}
-			err := node.RemoteCall(ip, "Node.FindNode", id, reply)
+			reply := make([]string, 0)
+			err := node.RemoteCall(ip, "Node.FindNode", id, &reply)
 			if err != nil {
-				sl.Remove(e)
+				sl.Remove(ip)
 				return
 			}
-			sl.SetQueried(e)
+			sl.SetQueried(ip)
 			findListLock.Lock()
-			*findList = append(*findList, *reply...)
+			*findList = append(*findList, reply...)
 			findListLock.Unlock()
-		}(element)
+		}(ip)
 	}
 	wg.Wait()
 }
 
-func (node *Node) MakeFetch(key string, queryList *[]*list.Element, findList *[]string, sl *ShortList) (ok bool, v string) {
+func (node *Node) MakeFetch(key string, queryList *[]string, findList *[]string, sl *ShortList) (ok bool, v string) {
 	ok, v = false, ""
 	id := hashString(key)
 	var wg sync.WaitGroup
 	wg.Add(len(*queryList))
 	findListLock := sync.Mutex{}
 	resLock := sync.Mutex{}
-	for _, e := range *queryList {
-		ip := e.Value.(ShortListNode).ip
-		go func(e *list.Element) {
+	for _, ip := range *queryList {
+		go func(ip string) {
 			defer wg.Done()
-			reply := &[]string{}
-			err := node.RemoteCall(ip, "Node.FindNode", id, reply)
+			reply := make([]string, 0)
+			err := node.RemoteCall(ip, "Node.FindNode", id, &reply)
 			if err != nil {
-				sl.Remove(e)
+				sl.Remove(ip)
 				return
 			}
-			sl.SetQueried(e)
+			sl.SetQueried(ip)
 			findListLock.Lock()
-			*findList = append(*findList, *reply...)
+			*findList = append(*findList, reply...)
 			findListLock.Unlock()
 			var val string
 			err = RemoteCall(ip, "Node.Fetch", key, &val)
@@ -226,19 +248,20 @@ func (node *Node) MakeFetch(key string, queryList *[]*list.Element, findList *[]
 				ok, v = true, val
 			}
 			resLock.Unlock()
-		}(e)
+		}(ip)
 	}
 	wg.Wait()
 	return
 }
 
 func (node *Node) RepublishPairList(pairs []Pair) {
+	logrus.Infof("[%s] RepublishPairList begins. pairs: %s", node.ip, pairs)
 	var wg sync.WaitGroup
 	wg.Add(len(pairs))
 	for _, pair := range pairs {
-		var done chan bool
 		go func(pair Pair) {
-			node.RepublishPair(pair, done)
+			done := make(chan bool)
+			go node.RepublishPair(pair, done)
 			select {
 			case <-done:
 				wg.Done()
@@ -248,9 +271,11 @@ func (node *Node) RepublishPairList(pairs []Pair) {
 		}(pair)
 	}
 	wg.Wait()
+	logrus.Infof("[%s] RepublishPairList successfully.", node.ip)
 }
 
 func (node *Node) RepublishPair(pair Pair, done chan bool) {
+	logrus.Infof("[%s] RepublishPair begins. pair: %s", node.ip, pair)
 	nodeList := node.NodeLookup(hashString(pair.Key))
 	var wg sync.WaitGroup
 	wg.Add(len(nodeList))
@@ -264,12 +289,14 @@ func (node *Node) RepublishPair(pair Pair, done chan bool) {
 			} else {
 				err := node.RemoteCall(ip, "Node.Store", &pair, nil)
 				if err != nil {
+					logrus.Errorf("[%s] RepublishPair. Node.Store failed. ip: %s", node.ip, ip)
 				}
 			}
 		}(ip)
 	}
 	wg.Wait()
 	done <- true
+	logrus.Infof("[%s] RepublishPair successfully.", node.ip)
 }
 func (node *Node) Refresh() {
 	refreshList := node.rt.GetRefreshList()
@@ -340,13 +367,17 @@ func (node *Node) Create() {
 func (node *Node) Join(ip string) bool {
 	logrus.Infof("[%s] What's up, dude! I'm joining, you know? ip: %s", node.ip, ip)
 	ind := node.WhichBucket(hashString(ip))
-	node.rt.buckets[ind].PushFront(ip)
+	if node.rt.buckets[ind].Size() < K {
+		node.rt.buckets[ind].PushFront(ip)
+	}
 	node.NodeLookup(node.id)
 	node.Maintain()
 	logrus.Infof("[%s] Join successfully. ip: %s", node.ip, ip)
 	return true
 }
 func (node *Node) Quit() {
+	logrus.Infof("[%s] Quit begins", node.ip)
+	defer logrus.Infof("[%s] Quit successfully.", node.ip)
 	if !node.online {
 		return
 	}
@@ -374,7 +405,8 @@ func (node *Node) Put(key string, value string) (flag bool) {
 	logrus.Infof("[%s] Put begins. key: %s, value: %s", node.ip, key[len(key)-5:], value[len(value)-5:])
 	logrus.Infof("[%s] Put. NodeLookup begins.", node.ip)
 	NodeList := node.NodeLookup(hashString(key))
-	logrus.Infof("[%s] Put. NodeLookup ends.", node.ip)
+	logrus.Infof("[%s] Put. NodeLookup ends. NodeList: %s", node.ip, NodeList)
+	flag = false
 	var flagLock sync.Mutex
 	var wg sync.WaitGroup
 	wg.Add(len(NodeList))
@@ -385,6 +417,10 @@ func (node *Node) Put(key string, value string) (flag bool) {
 				err := node.Store(&Pair{key, value}, nil)
 				if err != nil {
 					logrus.Errorf("[%s] Put failed. Store failed. ip: %s", node.ip, ip)
+				} else {
+					flagLock.Lock()
+					flag = true
+					flagLock.Unlock()
 				}
 			} else {
 				err := node.RemoteCall(ip, "Node.Store", &Pair{key, value}, nil)
@@ -399,17 +435,24 @@ func (node *Node) Put(key string, value string) (flag bool) {
 		}(ip)
 	}
 	wg.Wait()
-	logrus.Infof("[%s] Put successfully. key: %s, value: %s", node.ip, key[len(key)-5:], value[len(value)-5:])
+	if flag {
+		logrus.Infof("[%s] Put successfully. key: %s, value: %s", node.ip, key[len(key)-5:], value[len(value)-5:])
+	} else {
+		logrus.Infof("[%s] Put failed. key: %s, value: %s", node.ip, key[len(key)-5:], value[len(value)-5:])
+	}
 	return
 }
 
 // Get is actually the FindValue procedure
 func (node *Node) Get(key string) (ok bool, v string) {
+	logrus.Infof("[%s] Get begins. key: %s", node.ip, key[len(key)-5:])
 	var sl ShortList
 	id := hashString(key)
 	sl.Init(id)
 	findList := make([]string, 0)
+	logrus.Infof("[%s] Get. FindNode begins.", node.ip)
 	err := node.FindNode(id, &findList)
+	logrus.Infof("[%s] FindNode ends. findList: %s", node.ip, findList)
 	if err != nil {
 		return
 	}
@@ -421,6 +464,7 @@ func (node *Node) Get(key string) (ok bool, v string) {
 		findList = make([]string, 0)
 		ok, v = node.MakeFetch(key, &queryList, &findList, &sl)
 		if ok {
+			logrus.Infof("[%s] Get successfully.", node.ip)
 			return
 		}
 		changed := sl.Update(findList)
@@ -429,10 +473,12 @@ func (node *Node) Get(key string) (ok bool, v string) {
 			findList = make([]string, 0)
 			ok, v = node.MakeFetch(key, &queryList, &findList, &sl)
 			if ok {
+				logrus.Infof("[%s] Get successfully.", node.ip)
 				return
 			}
 			changed = sl.Update(findList)
 			if !changed {
+				logrus.Infof("[%s] Get failed. Not found.", node.ip)
 				return false, ""
 			}
 		}

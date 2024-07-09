@@ -10,7 +10,7 @@ import (
 
 const (
 	M                    int = 160
-	K                    int = 8
+	K                    int = 20
 	A                    int = 3 // The system-wide concurrency parameter alpha.
 	PingTime                 = 100 * time.Millisecond
 	RepublishCycleTime       = 15 * time.Second
@@ -19,6 +19,8 @@ const (
 	ExpireCycleTime          = 60 * time.Second
 	RefreshCycleTime         = 3 * time.Second
 	RefreshTime              = 15 * time.Second
+	NodeLookupTimeout        = 1 * time.Second
+	FindNodeTimeout          = 200 * time.Millisecond
 )
 
 func hashString(s string) *big.Int {
@@ -98,35 +100,46 @@ func (db *DataBase) GetAll() (res []Pair) {
 // a fake priority_queue for NodeLookup procedure
 
 type ShortListNode struct {
-	ip      string
-	queried bool
-	dis     *big.Int
+	ip  string
+	dis *big.Int
 }
 type ShortList struct {
 	nodes     *list.List
 	nodesLock sync.RWMutex
 	targetId  *big.Int
+	queried   map[string]bool
 }
 
 func (sl *ShortList) Init(id *big.Int) {
 	sl.nodes = list.New()
 	sl.targetId = new(big.Int).Set(id)
+	sl.queried = make(map[string]bool)
 }
-func (sl *ShortList) SetQueried(e *list.Element) {
-	slNode := e.Value.(ShortListNode)
-	e.Value = ShortListNode{
-		ip:      slNode.ip,
-		queried: true,
-		dis:     slNode.dis,
-	}
+
+func (sl *ShortList) SetQueried(ip string) {
+	sl.nodesLock.Lock()
+	defer sl.nodesLock.Unlock()
+	sl.queried[ip] = true
 }
 func (sl *ShortList) Size() int {
 	return sl.nodes.Len()
 }
+func (sl *ShortList) Find(ip string) *list.Element {
+	sl.nodesLock.RLock()
+	defer sl.nodesLock.RUnlock()
+	for e := sl.nodes.Front(); e != nil; e = e.Next() {
+		if e.Value.(ShortListNode).ip == ip {
+			return e
+		}
+	}
+	return nil
+}
 func (sl *ShortList) Insert(ip string) int {
+	if sl.Find(ip) != nil {
+		return -1
+	}
 	node := ShortListNode{
 		ip,
-		false,
 		new(big.Int).Xor(hashString(ip), sl.targetId),
 	}
 	sl.nodesLock.RLock()
@@ -145,23 +158,28 @@ func (sl *ShortList) Insert(ip string) int {
 	} else {
 		sl.nodes.InsertBefore(node, e)
 	}
-
+	sl.queried[ip] = false
 	sl.nodesLock.Unlock()
 	return i
 }
-func (sl *ShortList) Remove(e *list.Element) {
+func (sl *ShortList) Remove(ip string) {
 	sl.nodesLock.Lock()
 	defer sl.nodesLock.Unlock()
-	sl.nodes.Remove(e)
+	for e := sl.nodes.Front(); e != nil; e = e.Next() {
+		if e.Value.(ShortListNode).ip == ip {
+			sl.nodes.Remove(e)
+			break
+		}
+	}
 }
 
-func (sl *ShortList) GetAlphaNotQueried() (res []*list.Element) {
+func (sl *ShortList) GetAlphaNotQueried() (res []string) {
 	sl.nodesLock.RLock()
 	defer sl.nodesLock.RUnlock()
 	for e := sl.nodes.Front(); e != nil; e = e.Next() {
 		node := e.Value.(ShortListNode)
-		if !node.queried {
-			res = append(res, e)
+		if !sl.queried[node.ip] {
+			res = append(res, node.ip)
 		}
 		if len(res) == A {
 			return
@@ -169,13 +187,13 @@ func (sl *ShortList) GetAlphaNotQueried() (res []*list.Element) {
 	}
 	return
 }
-func (sl *ShortList) GetAllNotQueried() (res []*list.Element) {
+func (sl *ShortList) GetAllNotQueried() (res []string) {
 	sl.nodesLock.RLock()
 	defer sl.nodesLock.RUnlock()
 	for e := sl.nodes.Front(); e != nil; e = e.Next() {
 		node := e.Value.(ShortListNode)
-		if !node.queried {
-			res = append(res, e)
+		if !sl.queried[node.ip] {
+			res = append(res, node.ip)
 		}
 	}
 	return
@@ -184,7 +202,8 @@ func (sl *ShortList) GetAllNotQueried() (res []*list.Element) {
 func (sl *ShortList) Update(findList []string) (changed bool) {
 	changed = false
 	for _, ip := range findList {
-		if sl.Insert(ip) < K {
+		ind := sl.Insert(ip)
+		if ind != -1 && ind < K {
 			changed = true
 		}
 	}

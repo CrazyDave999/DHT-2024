@@ -43,15 +43,20 @@ func (buc *Bucket) Update(ip string, online bool) {
 				buc.nodes.PushFront(ip)
 				buc.nodesLock.Unlock()
 			} else {
-				buc.nodesLock.Lock()
+				buc.nodesLock.RLock()
 				backIp := buc.nodes.Back().Value.(string)
+				buc.nodesLock.RUnlock()
 				if !TryPing(backIp) {
+					buc.nodesLock.Lock()
 					buc.nodes.Remove(buc.nodes.Back())
 					buc.nodes.PushFront(ip)
+					buc.nodesLock.Unlock()
 				} else {
+					buc.nodesLock.Lock()
 					buc.nodes.MoveToFront(buc.nodes.Back())
+					buc.nodesLock.Unlock()
 				}
-				buc.nodesLock.Unlock()
+
 			}
 		}
 	} else {
@@ -67,6 +72,11 @@ func (buc *Bucket) PushFront(ip string) {
 	buc.nodesLock.Lock()
 	buc.nodes.PushFront(ip)
 	buc.nodesLock.Unlock()
+}
+func (buc *Bucket) Size() int {
+	buc.nodesLock.RLock()
+	defer buc.nodesLock.RUnlock()
+	return buc.nodes.Len()
 }
 
 type RoutingTable struct {
