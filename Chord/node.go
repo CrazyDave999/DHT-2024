@@ -3,10 +3,11 @@ package Chord
 import (
 	"crypto/sha1"
 	"fmt"
-	//"github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	"math/big"
 	"net"
 	"net/rpc"
+	"os"
 	"sync"
 	"time"
 )
@@ -14,8 +15,8 @@ import (
 func init() {
 	// You can use the logrus package to print pretty logs.
 	// Here we set the log output to a file.
-	//f, _ := os.Create("dht-chord-test.log")
-	//logrus.SetOutput(f)
+	f, _ := os.Create("dht-chord-test.log")
+	logrus.SetOutput(f)
 }
 
 const (
@@ -148,7 +149,6 @@ func (node *Node) Init(addr string) {
 		}
 		node.fingerStart[i] = new(IDType).Mod(new(IDType).Add(node.meta.Id, new(IDType).Exp(big.NewInt(2), big.NewInt(int64(i)), nil)), LENGTH)
 	}
-	//node.quit = make(chan bool, 1)
 	node.fixIndex = 0
 }
 
@@ -193,17 +193,15 @@ func (node *Node) RPCGetValue(key string, reply *string) error {
 		*reply = v
 		return nil
 	}
-	suc := &Meta{}
-	err := node.RPCGetSuccessor(struct{}{}, suc)
-	if err == nil && suc.Addr == node.meta.Addr {
-		node.backupLock.RLock()
-		v, ok = node.backup[key]
-		node.backupLock.RUnlock()
-		if ok {
-			*reply = v
-			return nil
-		}
+
+	node.backupLock.RLock()
+	v, ok = node.backup[key]
+	node.backupLock.RUnlock()
+	if ok {
+		*reply = v
+		return nil
 	}
+
 	*reply = ""
 	return fmt.Errorf("[%s] RPCGetValue. Failed getting key: %v. No such data exists", node.meta.Addr, key)
 }
@@ -897,7 +895,7 @@ func (node *Node) Put(key string, value string) bool {
 			//logrus.Error("Put failed when trying to Node.RPCPutInBackup.")
 		}
 	}
-	//logrus.Infof("[%s] Put key: %v successfully. suc: %s, sucSuc: %s", node.meta.Addr, key, suc.Addr, sucSuc.Addr)
+	logrus.Infof("[%s] Put key: %v successfully. suc: %s, sucSuc: %s", node.meta.Addr, key, suc.Addr, sucSuc.Addr)
 	return true
 }
 func (node *Node) Get(key string) (ok bool, v string) {
@@ -921,7 +919,7 @@ func (node *Node) Get(key string) (ok bool, v string) {
 	if err != nil {
 		ok = false
 		v = ""
-		//logrus.Errorf("[%s] Get failed when trying to RPCGetValue from: %s", node.meta.Addr, suc.Addr)
+		logrus.Errorf("[%s] Get failed when trying to RPCGetValue from: %s", node.meta.Addr, suc.Addr)
 		return
 	}
 	ok = true

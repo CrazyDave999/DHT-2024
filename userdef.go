@@ -1,6 +1,8 @@
 package main
 
-import "dht/Chord"
+import (
+	"dht/Kademlia"
+)
 
 /*
  * In this file, you need to implement the "NewNode" function.
@@ -15,8 +17,13 @@ import "dht/Chord"
 //	return node
 //}
 
+//	func NewNode(port int) dhtNode {
+//		node := new(Chord.Node)
+//		node.Init(portToAddr(localAddress, port))
+//		return node
+//	}
 func NewNode(port int) dhtNode {
-	node := new(Chord.Node)
+	node := new(Kademlia.Node)
 	node.Init(portToAddr(localAddress, port))
 	return node
 }
