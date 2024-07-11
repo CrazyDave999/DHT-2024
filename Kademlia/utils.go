@@ -3,6 +3,7 @@ package Kademlia
 import (
 	"container/list"
 	"crypto/sha1"
+	"github.com/sirupsen/logrus"
 	"math/big"
 	"sync"
 	"time"
@@ -10,17 +11,17 @@ import (
 
 const (
 	M                    int = 160
-	K                    int = 20
+	K                    int = 10
 	A                    int = 3 // The system-wide concurrency parameter alpha.
-	PingTime                 = 100 * time.Millisecond
+	PingTime                 = 200 * time.Millisecond
 	RepublishCycleTime       = 15 * time.Second
-	RepublishPairTimeOut     = 50 * time.Millisecond
+	RepublishPairTimeOut     = 250 * time.Millisecond
 	RepublishTimeOut         = 15 * time.Second
 	ExpireCycleTime          = 60 * time.Second
 	RefreshCycleTime         = 3 * time.Second
 	RefreshTime              = 15 * time.Second
-	NodeLookupTimeout        = 1 * time.Second
-	FindNodeTimeout          = 200 * time.Millisecond
+	NodeLookupTimeout        = 5 * time.Second
+	FindNodeTimeout          = 250 * time.Millisecond
 )
 
 func hashString(s string) *big.Int {
@@ -77,6 +78,7 @@ func (db *DataBase) CheckExpire() {
 		delete(db.NextRepublish, k)
 	}
 	db.dataLock.Unlock()
+	logrus.Infof("CheckExpire. keys: %s", keys)
 }
 func (db *DataBase) GetRepublishList() (res []Pair) {
 	db.dataLock.RLock()
@@ -168,6 +170,7 @@ func (sl *ShortList) Remove(ip string) {
 	for e := sl.nodes.Front(); e != nil; e = e.Next() {
 		if e.Value.(ShortListNode).ip == ip {
 			sl.nodes.Remove(e)
+			delete(sl.queried, ip)
 			break
 		}
 	}
@@ -176,7 +179,8 @@ func (sl *ShortList) Remove(ip string) {
 func (sl *ShortList) GetAlphaNotQueried() (res []string) {
 	sl.nodesLock.RLock()
 	defer sl.nodesLock.RUnlock()
-	for e := sl.nodes.Front(); e != nil; e = e.Next() {
+	i := 0
+	for e := sl.nodes.Front(); e != nil && i < K; e = e.Next() {
 		node := e.Value.(ShortListNode)
 		if !sl.queried[node.ip] {
 			res = append(res, node.ip)
@@ -184,17 +188,20 @@ func (sl *ShortList) GetAlphaNotQueried() (res []string) {
 		if len(res) == A {
 			return
 		}
+		i++
 	}
 	return
 }
 func (sl *ShortList) GetAllNotQueried() (res []string) {
 	sl.nodesLock.RLock()
 	defer sl.nodesLock.RUnlock()
-	for e := sl.nodes.Front(); e != nil; e = e.Next() {
+	i := 0
+	for e := sl.nodes.Front(); e != nil && i < K; e = e.Next() {
 		node := e.Value.(ShortListNode)
 		if !sl.queried[node.ip] {
 			res = append(res, node.ip)
 		}
+		i++
 	}
 	return
 }
