@@ -3,7 +3,6 @@ package Kademlia
 import (
 	"container/list"
 	"crypto/sha1"
-	"github.com/sirupsen/logrus"
 	"math/big"
 	"sync"
 	"time"
@@ -78,7 +77,6 @@ func (db *DataBase) CheckExpire() {
 		delete(db.NextRepublish, k)
 	}
 	db.dataLock.Unlock()
-	logrus.Infof("CheckExpire. keys: %s", keys)
 }
 func (db *DataBase) GetRepublishList() (res []Pair) {
 	db.dataLock.RLock()

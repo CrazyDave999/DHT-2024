@@ -2,12 +2,10 @@ package Kademlia
 
 import (
 	"fmt"
-	"github.com/sirupsen/logrus"
 	"math/big"
 	"math/rand"
 	"net"
 	"net/rpc"
-	"os"
 	"sync"
 	"time"
 )
@@ -27,8 +25,6 @@ type Node struct {
 }
 
 func init() {
-	f, _ := os.Create("dht-chord-test.log")
-	logrus.SetOutput(f)
 	for i := 0; i < M; i++ {
 		pow[i] = new(big.Int).Exp(big.NewInt(2), big.NewInt(int64(i)), nil)
 	}
@@ -38,14 +34,12 @@ func init() {
 func RemoteCall(ip string, method string, args interface{}, reply interface{}) error {
 	conn, err := net.DialTimeout("tcp", ip, PingTime)
 	if err != nil {
-		logrus.Errorf("Remote call failed. Dialing ip: %s, method: %s, error: %s", ip, method, err)
 		return err
 	}
 	client := rpc.NewClient(conn)
 	defer client.Close()
 	err = client.Call(method, args, reply)
 	if err != nil {
-		logrus.Errorf("Remote call failed. ip: %s, method: %s, error: %s", ip, method, err)
 		return err
 	}
 	return nil
@@ -115,7 +109,6 @@ func (node *Node) Update(ip string, online bool) {
 	ind := node.WhichBucket(hashString(ip))
 	if ind != -1 {
 		node.rt.Update(ind, ip, online)
-		//logrus.Infof("[%s] Update. ind: %v, ip: %s", node.ip, ind, ip)
 	}
 }
 
@@ -164,7 +157,6 @@ func (node *Node) FindNode(id *big.Int, reply *[]string) error {
 	case <-done:
 		return nil
 	case <-time.After(FindNodeTimeout):
-		logrus.Errorf("[%s]  FindNode. Timeout.", node.ip)
 		return nil
 	}
 }
@@ -208,7 +200,6 @@ func (node *Node) NodeLookup(id *big.Int, notify bool) (kClosest []string) {
 	case <-done:
 		return sl.GetKClosest()
 	case <-time.After(NodeLookupTimeout):
-		logrus.Errorf("[%s] NodeLookup. Timeout.", node.ip)
 		return sl.GetKClosest()
 	}
 }
@@ -269,8 +260,6 @@ func (node *Node) MakeFetch(key string, queryList *[]string, findList *[]string,
 }
 
 func (node *Node) RepublishPairList(pairs []Pair) {
-	logrus.Infof("[%s] RepublishPairList begins. pairs: %s", node.ip, pairs)
-
 	done := make(chan bool, 1)
 	go func() {
 		var wg sync.WaitGroup
@@ -293,15 +282,12 @@ func (node *Node) RepublishPairList(pairs []Pair) {
 
 	select {
 	case <-done:
-		logrus.Infof("[%s] RepublishPairList successfully.", node.ip)
 	case <-time.After(RepublishTimeOut):
-		logrus.Errorf("[%s] RepublishPairList failed. Timeout.", node.ip)
 	}
 
 }
 
 func (node *Node) RepublishPair(pair Pair, done chan bool) {
-	//logrus.Infof("[%s] RepublishPair begins. pair: %s", node.ip, pair)
 	nodeList := node.NodeLookup(hashString(pair.Key), false)
 	var wg sync.WaitGroup
 	wg.Add(len(nodeList))
@@ -311,32 +297,25 @@ func (node *Node) RepublishPair(pair Pair, done chan bool) {
 			if ip == node.ip {
 				err := node.Store(&pair, nil)
 				if err != nil {
-					logrus.Errorf("[%s] RepublishPair. Store failed.", node.ip)
 				} else {
-					//logrus.Errorf("[%s] RepublishPair. Store successfully.", node.ip)
 				}
 			} else {
 				err := node.RemoteCall(ip, "Node.Store", &pair, nil, true)
 				if err != nil {
-					logrus.Errorf("[%s] RepublishPair. Node.Store failed. ip: %s", node.ip, ip)
 				} else {
-					//logrus.Infof("[%s] RepublishPair. Node.Store successfully. ip: %s", node.ip, ip)
 				}
 			}
 		}(ip)
 	}
 	wg.Wait()
 	done <- true
-	//logrus.Infof("[%s] RepublishPair ends.", node.ip)
 }
 func (node *Node) Refresh() {
 	refreshList := node.rt.GetRefreshList()
 	if len(refreshList) > 0 {
 		randIndex := rand.Intn(len(refreshList))
 		refreshIndex := refreshList[randIndex]
-		//logrus.Infof("[%s] Refresh begins. refreshList: %v", node.ip, refreshList)
 		node.NodeLookup(new(big.Int).Xor(pow[refreshIndex], node.id), false)
-		//logrus.Infof("[%s] Refresh ends", node.ip)
 	}
 }
 
@@ -362,21 +341,6 @@ func (node *Node) Maintain() {
 			time.Sleep(RefreshCycleTime)
 		}
 	}()
-
-	//go func() {
-	//	for node.online {
-	//		allNodes := make([]string, 0)
-	//		for _, buc := range node.rt.buckets {
-	//			buc.nodesLock.RLock()
-	//			for e := buc.nodes.Front(); e != nil; e = e.Next() {
-	//				allNodes = append(allNodes, e.Value.(string))
-	//			}
-	//			buc.nodesLock.RUnlock()
-	//		}
-	//		logrus.Infof("[%s] Printing the whole routing table: %s", node.ip, allNodes)
-	//		time.Sleep(2 * time.Second)
-	//	}
-	//}()
 }
 
 //
@@ -404,39 +368,30 @@ func (node *Node) Run() {
 	}()
 }
 func (node *Node) Create() {
-	logrus.Infof("Welcome to Kademlia test! This is stupid debugger CrazyDave. Have fun!")
 	node.Maintain()
 }
 
 func (node *Node) Join(ip string) bool {
-	logrus.Infof("[%s] What's up, dude! I'm joining, you know? ip: %s", node.ip, ip)
 	ind := node.WhichBucket(hashString(ip))
 	if node.rt.buckets[ind].Size() < K {
 		node.rt.buckets[ind].PushFront(ip)
 	}
-	logrus.Infof("[%s] Join. NodeLookup begins.", node.ip)
-	NodeList := node.NodeLookup(node.id, true)
-	logrus.Infof("[%s] Join. NodeLookup ends. NodeList: %v", node.ip, NodeList)
+	node.NodeLookup(node.id, true)
 	node.Maintain()
-	logrus.Infof("[%s] Join successfully. ip: %s", node.ip, ip)
 	return true
 }
 func (node *Node) Quit() {
-	logrus.Infof("[%s] Quit begins", node.ip)
 	if !node.online {
 		return
 	}
 	republishList := node.db.GetAll()
-	logrus.Infof("[%s] Quit. RepublishPairList begins. republishList: %s", node.ip, republishList)
 	node.RepublishPairList(republishList)
-	logrus.Infof("[%s] Quit. RepublishPairList ends. republishList: %s", node.ip, republishList)
 	err := node.listener.Close()
 	if err != nil {
 	}
 	node.onlineLock.Lock()
 	node.online = false
 	node.onlineLock.Unlock()
-	logrus.Infof("[%s] Quit successfully.", node.ip)
 }
 func (node *Node) ForceQuit() {
 	if !node.online {
@@ -450,10 +405,7 @@ func (node *Node) ForceQuit() {
 	node.onlineLock.Unlock()
 }
 func (node *Node) Put(key string, value string) (flag bool) {
-	logrus.Infof("[%s] Put begins. key: %s, value: %s", node.ip, key[len(key)-5:], value[len(value)-5:])
-	logrus.Infof("[%s] Put. NodeLookup begins.", node.ip)
 	NodeList := node.NodeLookup(hashString(key), true)
-	logrus.Infof("[%s] Put. NodeLookup ends. NodeList: %s", node.ip, NodeList)
 	flag = false
 	var flagLock sync.Mutex
 	var wg sync.WaitGroup
@@ -464,9 +416,7 @@ func (node *Node) Put(key string, value string) (flag bool) {
 			if node.ip == ip {
 				err := node.Store(&Pair{key, value}, nil)
 				if err != nil {
-					logrus.Errorf("[%s] Put. Store failed. ip: %s", node.ip, ip)
 				} else {
-					logrus.Errorf("[%s] Put. Store successfully. ip: %s", node.ip, ip)
 					flagLock.Lock()
 					flag = true
 					flagLock.Unlock()
@@ -474,9 +424,7 @@ func (node *Node) Put(key string, value string) (flag bool) {
 			} else {
 				err := node.RemoteCall(ip, "Node.Store", &Pair{key, value}, nil, true)
 				if err != nil {
-					logrus.Errorf("[%s] Put. Node.Store failed. ip: %s", node.ip, ip)
 				} else {
-					logrus.Errorf("[%s] Put. Node.Store successfully. ip: %s", node.ip, ip)
 					flagLock.Lock()
 					flag = true
 					flagLock.Unlock()
@@ -485,24 +433,16 @@ func (node *Node) Put(key string, value string) (flag bool) {
 		}(ip)
 	}
 	wg.Wait()
-	if flag {
-		logrus.Infof("[%s] Put successfully. key: %s, value: %s", node.ip, key[len(key)-5:], value[len(value)-5:])
-	} else {
-		logrus.Infof("[%s] Put failed. key: %s, value: %s", node.ip, key[len(key)-5:], value[len(value)-5:])
-	}
 	return
 }
 
 // Get is actually the FindValue procedure
 func (node *Node) Get(key string) (ok bool, v string) {
-	logrus.Infof("[%s] Get begins. key: %s", node.ip, key[len(key)-5:])
 	var sl ShortList
 	id := hashString(key)
 	sl.Init(id)
 	findList := make([]string, 0)
-	logrus.Infof("[%s] Get. FindNode begins.", node.ip)
 	err := node.FindNode(id, &findList)
-	logrus.Infof("[%s] FindNode ends. findList: %s", node.ip, findList)
 	if err != nil {
 		return
 	}
@@ -514,7 +454,6 @@ func (node *Node) Get(key string) (ok bool, v string) {
 		findList = make([]string, 0)
 		ok, v = node.MakeFetch(key, &queryList, &findList, &sl, true)
 		if ok {
-			logrus.Infof("[%s] Get successfully.", node.ip)
 			return
 		}
 		changed := sl.Update(findList)
@@ -523,12 +462,10 @@ func (node *Node) Get(key string) (ok bool, v string) {
 			findList = make([]string, 0)
 			ok, v = node.MakeFetch(key, &queryList, &findList, &sl, true)
 			if ok {
-				logrus.Infof("[%s] Get successfully.", node.ip)
 				return
 			}
 			changed = sl.Update(findList)
 			if !changed {
-				logrus.Infof("[%s] Get failed. Not found.", node.ip)
 				return false, ""
 			}
 		}
